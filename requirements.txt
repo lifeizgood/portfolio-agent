@@ -1,0 +1,9 @@
+torch>=2.5
+transformers>=4.56
+accelerate
+langchain-core>=1.0
+langchain-huggingface>=1.0
+langgraph>=1.0
+pydantic>=2.7
+pypdf>=5.0
+pytest

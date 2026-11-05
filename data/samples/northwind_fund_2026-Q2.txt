@@ -1,0 +1,19 @@
+NORTHWIND GROWTH PARTNERS III, L.P.
+Quarterly Capital Account Statement
+Investor: Family Trust (nickname)
+Date issued: October 14, 2026
+
+Reporting period: April 1, 2026 through June 30, 2026
+Net asset values below are as of June 30, 2026.
+
+CAPITAL ACCOUNT
+  Beginning capital balance (03/31/2026)          $412,300
+  Contributions                                     $25,000
+  Distributions                                          $0
+  Net investment income / (loss)                    ($2,150)
+  Unrealized gain / (loss)                          $18,600
+  Ending capital balance (06/30/2026)             $453,750
+
+Unfunded commitment remaining: $175,000 (not included in capital balance)
+
+Fictional sample data for testing.

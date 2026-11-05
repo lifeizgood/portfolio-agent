@@ -1,0 +1,16 @@
+EXAMPLE BROKERAGE, INC.                         Monthly Account Statement
+Account: Joint Taxable (nickname)               Statement period: Sep 1 - Sep 30, 2026
+Account number: XXXX-XX12 (masked)
+
+ACCOUNT SUMMARY                                  As of 09/30/2026
+  Total account value                            $187,451.50
+
+HOLDINGS
+  Symbol  Description                          Quantity     Price        Market Value
+  VTI     Vanguard Total Stock Market ETF        420.000    $318.25      $133,665.00
+  BND     Vanguard Total Bond Market ETF         510.000     $73.10       $37,281.00
+  --      Money market sweep (cash)                   --         --       $16,505.50
+
+  Total                                                                  $187,451.50
+
+This statement is for illustration only (fictional sample data).

@@ -1,0 +1,13 @@
+EXAMPLE BROKERAGE, INC.                         Monthly Account Statement
+Account: Roth IRA (nickname)                    Statement period: Sep 1 - Sep 30, 2026
+
+ACCOUNT SUMMARY                                  As of 09/30/2026
+  Total account value                            $95,000.00
+
+HOLDINGS
+  Symbol  Description                          Quantity     Price        Market Value
+  VTI     Vanguard Total Stock Market ETF        200.000    $318.25       $63,650.00
+  BND     Vanguard Total Bond Market ETF         100.000     $73.10        $7,310.00
+
+(Holdings deliberately don't add up to the total: this file should land in the
+review queue. Fictional sample data.)
