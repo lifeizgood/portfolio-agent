@@ -25,7 +25,11 @@ Return ONLY one JSON object, no prose, with this shape:
   ]
 }
 Rules: numbers without currency symbols or commas. Do not invent values that are
-not in the text. If a field is not shown, use null."""
+not in the text. If a field is not shown, use null, except "holdings", which is
+never null. If the statement shows only one balance for the account (for example
+a private fund's capital account), return exactly one holding: description = the
+fund name, value = the ending balance, quantity and price null, and use the same
+number for statement_total. Unfunded commitments are not part of the value."""
 
 
 class ExtractionError(Exception):
