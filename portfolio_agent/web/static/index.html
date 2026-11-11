@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Portfolio Agent</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>Portfolio</h1>
+  <nav>
+    <button class="tab active" data-tab="dashboard">Dashboard</button>
+    <button class="tab" data-tab="inbox">Inbox <span id="inbox-badge" class="badge" hidden></span></button>
+    <button class="tab" data-tab="accounts">Accounts &amp; logins</button>
+    <button class="tab" data-tab="debug">Debug</button>
+  </nav>
+</header>
+
+<main>
+<!-- Dashboard ------------------------------------------------------------ -->
+<section id="dashboard" class="panel active">
+  <div class="tiles">
+    <div class="tile"><div class="label">Net worth</div><div id="net-worth" class="big">–</div>
+      <div id="net-worth-note" class="muted"></div></div>
+    <div class="tile"><div class="label">Last nightly run</div><div id="last-nightly">–</div>
+      <div id="last-nightly-note" class="muted"></div></div>
+    <div class="tile"><div class="label">Refresh public-security accounts</div>
+      <button id="refresh-btn" class="primary">Refresh</button>
+      <div id="refresh-status" class="muted"></div></div>
+  </div>
+  <div id="kill-banner" class="banner warn" hidden>Kill switch is on: no fetcher will run.
+    <button id="kill-off">Turn off</button></div>
+
+  <div class="card">
+    <div class="controls">
+      <div class="seg" id="period">
+        <button data-p="1M">1M</button><button data-p="3M">3M</button><button data-p="YTD">YTD</button>
+        <button data-p="1Y">1Y</button><button data-p="3Y">3Y</button><button data-p="All" class="on">All</button>
+      </div>
+      <label>From <input type="date" id="start"></label>
+      <label>To <input type="date" id="end"></label>
+      <label>View <select id="granularity"><option value="daily">Daily</option><option value="monthly">Monthly</option></select></label>
+      <label>Split by <select id="group"><option value="account">Account</option><option value="institution">Institution</option><option value="type">Type</option></select></label>
+      <label title="Show the history using only values retrieved by this date">As known on <input type="date" id="known-on"></label>
+    </div>
+    <div class="chart-wrap"><canvas id="chart"></canvas></div>
+    <p id="chart-empty" class="muted" hidden>No values yet. Add a login under Accounts &amp; logins, then press Refresh.</p>
+  </div>
+
+  <div class="card">
+    <h2>Accounts</h2>
+    <table id="positions"><thead><tr><th>Account</th><th>Login</th><th>Status</th>
+      <th class="num">Value</th><th>As of</th><th>Retrieved</th><th></th></tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card" id="holdings-card" hidden>
+    <h2 id="holdings-title">Holdings</h2>
+    <table id="holdings"><thead><tr><th>Symbol</th><th>Description</th><th class="num">Quantity</th>
+      <th class="num">Price</th><th class="num">Value</th><th>As of</th><th></th></tr></thead><tbody></tbody></table>
+  </div>
+</section>
+
+<!-- Inbox ------------------------------------------------------------------ -->
+<section id="inbox" class="panel">
+  <div class="card"><h2>Inbox</h2>
+    <p class="muted">Values held for your approval, questions, verification-code requests and proposed playbook changes.</p>
+    <div id="inbox-list"></div>
+  </div>
+</section>
+
+<!-- Debug ---------------------------------------------------------------------- -->
+<section id="debug" class="panel">
+  <div class="card">
+    <div class="row" style="justify-content: space-between"><h2>Runs</h2><button id="debug-reload">Reload</button></div>
+    <p class="muted">Every nightly run and Refresh. Open one to see each login's steps, the pages it captured and what it stored.</p>
+    <table id="run-list"><thead><tr><th>Run</th><th>Kind</th><th>Started</th><th>Took</th><th>Logins</th>
+      <th>Status</th><th>Result</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="card" id="run-detail" hidden></div>
+</section>
+
+<!-- Accounts & logins ------------------------------------------------------- -->
+<section id="accounts" class="panel">
+  <div class="card">
+    <h2>Logins</h2>
+    <p class="muted">One login can hold several accounts. Every account found on a login's pages gets its own history.</p>
+    <table id="login-list"><thead><tr><th>Login</th><th>Institution</th><th>Accounts</th><th>Cadence</th>
+      <th>Username &amp; password saved</th><th>Last fetched</th><th></th></tr></thead><tbody></tbody></table>
+    <button id="new-login">Add login</button>
+  </div>
+
+  <div class="card" id="login-form-card" hidden>
+    <h2 id="login-form-title">Add login</h2>
+    <form id="login-form" autocomplete="off">
+      <div class="grid">
+        <label>Name<input name="name" required placeholder="Merrill Lynch"></label>
+        <label>Institution<input name="institution" required placeholder="Merrill Lynch"></label>
+        <label>Access method<select name="access_method">
+          <option value="browser">Browser</option><option value="api">API</option>
+          <option value="email_statement">Email statement</option><option value="manual">Manual</option></select></label>
+        <label>Login page URL<input name="login_url" type="url" placeholder="https://www.mymerrill.com"></label>
+        <label>Allowed domains<input name="allowed_domains" placeholder="defaults to the login page's domain"></label>
+        <label>2FA method<select name="twofa_method">
+          <option value="remembered_device">Remembered device</option><option value="sms">SMS</option>
+          <option value="email">Email</option><option value="authenticator">Authenticator app</option></select></label>
+        <label>Cadence<select name="cadence"><option value="nightly">Nightly</option><option value="quarterly">Quarterly</option></select></label>
+        <label class="check"><input type="checkbox" name="holds_public" checked> Holds public securities (included in Refresh)</label>
+        <label>Status<select name="status"><option value="active">Active</option><option value="closed">Closed</option></select></label>
+        <label>Closed on<input name="closed_on" type="date"></label>
+      </div>
+      <details open><summary>Account rules for this login</summary>
+        <div class="grid">
+          <label>Skip these categories<input name="skip_categories" placeholder="e.g. Investments (already fetched by another login)"></label>
+          <label>Debts: store as negative<input name="liability_categories" placeholder="e.g. Loans, Credit cards"></label>
+          <label class="check"><input type="checkbox" name="skip_other_institutions"> Skip accounts the page shows as held at another institution (e.g. Merrill on a Bank of America page)</label>
+        </div>
+      </details>
+      <details><summary>Login steps (optional; blank = detect automatically)</summary>
+        <div class="grid">
+          <label>Username field selector<input name="username_selector" placeholder="e.g. #userid"></label>
+          <label>Password field selector<input name="password_selector" placeholder="e.g. input[type=password]"></label>
+          <label>Sign-in button selector<input name="submit_selector" placeholder="blank = press Enter"></label>
+          <label>Holdings page URLs, one per line<textarea name="holdings_urls" rows="3"
+            placeholder="Pages that together show every account. Blank = the agent finds them."></textarea></label>
+        </div>
+      </details>
+      <div class="row"><button type="submit" class="primary">Save login</button>
+        <button type="button" id="cancel-login">Cancel</button><span id="login-msg" class="msg"></span></div>
+    </form>
+
+    <div id="cred-section" hidden>
+      <h3>Username and password</h3>
+      <p class="muted">Stored encrypted on this Mac. Never sent to the model or written to logs.</p>
+      <form id="cred-form" autocomplete="off">
+        <div class="grid">
+          <label>Username<input name="username" autocomplete="off"></label>
+          <label>Password<span class="pw"><input name="password" type="password" autocomplete="new-password">
+            <button type="button" id="eye" class="eye" title="Show password" aria-label="Show password">&#128065;</button></span></label>
+        </div>
+        <div class="row"><button type="submit" class="primary">Save username &amp; password</button><span id="cred-msg" class="msg"></span></div>
+      </form>
+      <p class="muted">First time: sign in by hand once so the portal remembers this device:<br>
+        <code id="open-browser-cmd"></code></p>
+
+      <h3>Accounts under this login</h3>
+      <p class="muted">Found automatically on each fetch. The first time an account is seen, the Inbox asks whether to include it. <b>Excluded</b> accounts are left out of every future fetch, chart and total; change it here at any time.</p>
+      <table id="login-accounts"><thead><tr><th>Display name</th><th>As shown on the portal</th><th>Category</th><th>Type</th>
+        <th>In portfolio?</th><th>Debt (negative)</th><th>Closed on</th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+</section>
+</main>
+
+<!-- View Source -->
+<dialog id="source">
+  <div class="dialog-head"><h2 id="source-title">Source</h2><button id="source-close">Close</button></div>
+  <div id="source-meta" class="muted"></div>
+  <div id="source-body"></div>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

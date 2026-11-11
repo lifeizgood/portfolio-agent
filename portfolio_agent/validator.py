@@ -1,64 +1,122 @@
-"""Validator: deterministic checks in plain Python, no LLM.
+"""Validator: deterministic checks in plain Python, no LLM (spec §7).
 
-A snapshot enters long-term memory only if `validate(...).ok` is True. This is
-the answer to "how do you know the extracted numbers are right?"
+A snapshot enters long-term memory only if `validate(...).ok` is True and it has
+no holds (or the user approved it). Check numbers match the spec's V1..V9.
 """
 
-from datetime import date
+import re
+from datetime import date, datetime, timedelta
 
 from . import config
-from .schemas import Snapshot, ValidationResult
+from .schemas import Extraction, Snapshot, ValidationResult
+from .timeutil import now
 
 
 def validate(snap: Snapshot, previous: Snapshot | None = None,
-             today: date | None = None, market_move: float | None = None) -> ValidationResult:
+             today: date | datetime | None = None,
+             market_move: float | None = None, liability: bool = False) -> ValidationResult:
     """
-    previous:    the last accepted snapshot for the same account, if any
-    market_move: benchmark return over the same period (e.g. 0.04 = +4%), if known;
-                 used to tell a real move from a parsing error
+    previous:    the nearest earlier accepted snapshot for the same account (spec D19)
+    market_move: benchmark return over the same period (e.g. 0.04 = +4%), if known
     """
-    today = today or date.today()
     errors: list[str] = []
     warnings: list[str] = []
+    holds: list[str] = []
 
-    if not snap.holdings:
+    # V1 non-empty (an account the page shows at exactly $0 may have no rows)
+    if not snap.holdings and snap.statement_total != 0:
         errors.append("No holdings extracted.")
 
-    # 1. Holdings must sum to the total printed on the statement.
-    if snap.statement_total is not None and snap.statement_total > 0:
-        diff = abs(snap.total - snap.statement_total) / snap.statement_total
+    # V2 holdings sum to the total shown on the page or statement
+    if snap.statement_total:
+        diff = abs(snap.total - snap.statement_total) / abs(snap.statement_total)
         if diff > config.SUM_TOLERANCE:
-            errors.append(f"Holdings sum to {snap.total:,.2f} but statement total is "
+            errors.append(f"Holdings sum to {snap.total:,.2f} but the stated total is "
                           f"{snap.statement_total:,.2f} ({diff:.1%} off).")
     else:
-        warnings.append("No statement total to reconcile against.")
+        warnings.append("No stated total to reconcile against.")
 
-    # 2. quantity x price should match value for each holding that has both.
     for h in snap.holdings:
-        if h.value < 0:
+        # V4 sign: assets are never negative; a liability (owed) is never positive
+        if not liability and h.value < 0:
             errors.append(f"Negative value for {h.description}.")
+        if liability and h.value > 0:
+            errors.append(f"Positive value for {h.description} on a liability account.")
+        # A holding's own date may be older than the page, never later.
+        if h.price_as_of and h.price_as_of > snap.as_of_date:
+            errors.append(f"{h.description}: as-of {h.price_as_of} is after the page's "
+                          f"as-of {snap.as_of_date}.")
+        # V3 qty x price vs the portal's own value (no market feed, spec C3)
         if h.quantity is not None and h.price is not None and h.value:
             implied = h.quantity * h.price
             if abs(implied - h.value) / abs(h.value) > config.VALUE_TOLERANCE:
                 errors.append(f"{h.description}: {h.quantity} x {h.price} = {implied:,.2f},"
                               f" but value is {h.value:,.2f}.")
 
-    # 3. The as-of date must be sane.
-    if snap.as_of_date > today:
-        errors.append(f"As-of date {snap.as_of_date} is in the future.")
-    if previous and snap.as_of_date < previous.as_of_date:
-        errors.append(f"As-of date {snap.as_of_date} is earlier than the last accepted "
-                      f"value ({previous.as_of_date}).")
+    # V5 as-of not in the future. (V6, "not earlier than the last value", was
+    # removed: out-of-order ingestion is valid, spec C4.)
+    if isinstance(today, datetime):
+        late_limit = today + timedelta(minutes=config.FUTURE_SLACK_MIN)
+        if snap.as_of_datetime > late_limit:
+            errors.append(f"As-of {snap.as_of_datetime:%Y-%m-%d %H:%M} is in the future.")
+    else:
+        today_d = today or now().astimezone().date()
+        if snap.as_of_date > today_d:
+            errors.append(f"As-of date {snap.as_of_date} is in the future.")
+        elif today is None and snap.as_of_datetime > now() + timedelta(minutes=config.FUTURE_SLACK_MIN):
+            errors.append(f"As-of {snap.as_of_datetime:%Y-%m-%d %H:%M} is in the future.")
 
-    # 4. A large move must be explainable by the market; otherwise flag it.
-    if previous and previous.total > 0 and not errors:
+    # V8 continuity against the nearest earlier value. A big unexplained move may
+    # well be real, so it is held for approval rather than rejected (spec C6:
+    # re-extracting a correct reading can't help).
+    if previous and previous.total and not errors:
         change = snap.total / previous.total - 1
         unexplained = change - (market_move or 0.0)
         if abs(unexplained) > config.LARGE_MOVE:
-            msg = (f"Total moved {change:+.1%} since {previous.as_of_date}"
-                   + (f" vs market {market_move:+.1%}" if market_move is not None else "")
-                   + "; check for a parsing error, deposit or withdrawal.")
-            # Without a market reference we can't tell, so reject and ask a human.
-            errors.append(msg)
+            holds.append(
+                f"Total moved {change:+.1%} since {previous.as_of_date}"
+                + (f" vs market {market_move:+.1%}" if market_move is not None else "")
+                + ". Approve if real (deposit, withdrawal, big market move); reject if misread.")
 
-    return ValidationResult(ok=not errors, errors=errors, warnings=warnings)
+    return ValidationResult(ok=not errors, errors=errors, warnings=warnings, holds=holds)
+
+
+def validate_extraction(ext: Extraction) -> list[str]:
+    """Checks across all accounts read from one document."""
+    errors: list[str] = []
+    if not ext.accounts:
+        errors.append("No accounts extracted.")
+    keys = [a.key for a in ext.accounts]
+    if len(keys) != len(set(keys)):
+        errors.append("The same account was extracted twice; list each account once.")
+    # The page's overall total must be covered. Accounts may add up to MORE than it:
+    # portals leave some accounts out of the overall value, and those are still kept.
+    if ext.grand_total and ext.accounts:
+        found = sum(a.statement_total if a.statement_total is not None else a.total
+                    for a in ext.accounts)
+        short = (ext.grand_total - found) / ext.grand_total
+        if short > config.SUM_TOLERANCE:
+            errors.append(f"The accounts extracted add up to {found:,.2f}, less than the page's "
+                          f"overall total of {ext.grand_total:,.2f} ({short:.1%} short). "
+                          "An account is probably missing; extract every account shown.")
+    return errors
+
+
+# Account numbers shown on a line of their own, as portals list them under the
+# account name: "12A-34567", "...1234", "xxxx1234", "****1234".
+_ACCOUNT_LINE = re.compile(
+    r"^\s*(?:[A-Z0-9]{3}-[A-Z0-9]{5}|(?:\.{3}|…|[xX*]{3,}[- ]?)[A-Z0-9]{4})\s*$", re.M)
+
+
+def unlisted_accounts(text: str, ext: Extraction) -> list[str]:
+    """Account numbers on the page whose last 4 characters match no extracted account.
+    Deterministic, so a skipped account is caught even when it sits outside every total."""
+    have = {(a.account_suffix or "")[-4:] for a in ext.accounts}
+    missing = []
+    for m in _ACCOUNT_LINE.finditer(text or ""):
+        last4 = re.sub(r"[^A-Z0-9]", "", m.group(0).upper())[-4:]
+        if last4 not in have and last4 not in missing:
+            missing.append(last4)
+    return [f"The page lists an account ending {x} that wasn't extracted. Extract every "
+            "account shown, including ones outside the overall total or in a separate "
+            "section, and give each its account_suffix." for x in missing]

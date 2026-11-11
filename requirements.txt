@@ -7,3 +7,9 @@ langgraph>=1.0
 pydantic>=2.7
 pypdf>=5.0
 pytest
+# Stage 1: dashboard, browser fetcher, encrypted logins
+fastapi>=0.115
+uvicorn>=0.30
+playwright>=1.47        # then run: python -m playwright install chromium
+cryptography>=43
+httpx>=0.27             # FastAPI test client

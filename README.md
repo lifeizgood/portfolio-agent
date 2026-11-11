@@ -13,9 +13,39 @@ ReAct Q&A agent. Portal fetchers come later and plug into the same pieces.
 cd portfolio-agent
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-pytest -q                     # 15 tests, uses a fake model, no download needed
+python -m playwright install chromium   # browser for the portal fetcher
+pytest -q                     # 33 tests, fake model and fake pages, no download needed
 code .
 ```
+
+## Stage 1: one portal end to end
+
+See `docs/spec.md` §2 for the stages.
+
+```bash
+python -m portfolio_agent.cli serve      # dashboard at http://127.0.0.1:8765
+```
+
+1. **Accounts & logins → Add login.** One login can hold several accounts; each account gets its own history.
+   - Name, institution and login page URL (Merrill: `https://www.mymerrill.com`).
+   - Allowed domains default to the login page's domain. Add any domain the portal sends you to, comma-separated (Merrill: `mymerrill.com, ml.com`).
+   - Optional login steps: field selectors, and the holdings page URLs (one per line) that together show every account. Leave them blank and the fetcher detects the login fields and uses the local LLM to find the holdings page.
+2. **Save the username and password.** They're encrypted with a key in `~/.portfolio-agent/secret.key` (mode 600). Use the eye icon to view them.
+3. **Sign in by hand once** so the portal remembers this device:
+   `python -m portfolio_agent.cli open-browser <login id>`
+   This uses the same browser profile the fetcher uses, stored in `data/private/browser/`.
+4. **Press Refresh.** The extractor reads every account on the page.
+   - The accounts must add up to the page's total for all accounts; if one is missing, the reading is rejected.
+   - Each new account appears under its login as **pending**, and its first value is held in the **Inbox**. Check it with **View Source** (screenshot, page text, page HTML), then approve it.
+   - Rename an account, change its type, or set it to **ignored** under Accounts & logins.
+   - If the portal asks for a verification code, the inbox asks you for it.
+5. **Nightly run:** `python -m portfolio_agent.cli nightly`. Schedule it with launchd. Each login is limited to 2 logins per night.
+
+**Test data:** the fictional samples in `data/samples/` stay for testing. Statements ingested with `cli ingest` aren't tied to any account, so the dashboard never shows them. To keep them out of your real database entirely, use `--db /tmp/test.db`.
+
+**Kill switch:** while `data/private/STOP` exists, no fetcher runs.
+
+**Evidence:** saved under `data/private/evidence/`, which is gitignored.
 
 In VS Code: Cmd+Shift+P → "Python: Select Interpreter" → `.venv`. Install the
 Python and Jupyter extensions.
@@ -26,9 +56,9 @@ Set `PA_MODEL_ID` (default `Qwen/Qwen2.5-14B-Instruct`). With 128GB of memory:
 
 | Model | Memory (bf16) | Use |
 |---|---|---|
-| `Qwen/Qwen2.5-7B-Instruct` | ~15GB | fast prompt iteration |
-| `Qwen/Qwen2.5-14B-Instruct` | ~30GB | default balance |
-| `Qwen/Qwen2.5-32B-Instruct` | ~65GB | most reliable JSON / ReAct format |
+| `Qwen/Qwen2.5-7B-Instruct` | ~15GB | fastest |
+| `Qwen/Qwen2.5-14B-Instruct` | ~30GB | default; good balance |
+| `Qwen/Qwen2.5-32B-Instruct` | ~65GB | most reliable JSON / ReAct format, slower |
 
 ```bash
 export PA_MODEL_ID=Qwen/Qwen2.5-32B-Instruct

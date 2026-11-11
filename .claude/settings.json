@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./data/private/**)",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./**/*.db)"
+    ],
+    "allow": [
+      "Bash(pytest *)"
+    ]
+  }
+}

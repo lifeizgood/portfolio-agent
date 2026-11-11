@@ -23,7 +23,7 @@ TODAY = date(2026, 11, 4)
 
 GOOD = {
     "institution": "Example Brokerage", "account": "Joint Taxable",
-    "as_of_date": "2026-09-30", "statement_total": 187451.50,
+    "as_of": "2026-09-30T16:00:00", "statement_total": 187451.50,
     "holdings": [
         {"symbol": "VTI", "description": "Vanguard Total Stock Market ETF",
          "quantity": 420, "price": 318.25, "value": 133665.00},
@@ -52,7 +52,7 @@ def test_valid_snapshot_passes():
 
 def test_sum_mismatch_rejected():
     r = validate(snap(statement_total=200000), today=TODAY)
-    assert not r.ok and "statement total" in r.errors[0]
+    assert not r.ok and "stated total" in r.errors[0]
 
 
 def test_qty_price_mismatch_rejected():
@@ -63,18 +63,20 @@ def test_qty_price_mismatch_rejected():
     assert not r.ok and "Vanguard Total Stock" in r.errors[0]
 
 
-def test_future_and_backwards_dates_rejected():
-    assert not validate(snap(as_of_date="2027-01-01"), today=TODAY).ok
+def test_future_rejected_but_earlier_as_of_accepted():
+    assert not validate(snap(as_of="2027-01-01"), today=TODAY).ok
     prev = snap()
-    assert not validate(snap(as_of_date="2026-06-30"), previous=prev, today=TODAY).ok
+    # Out-of-order ingestion is valid (spec C4): an older as-of is not an error.
+    assert validate(snap(as_of="2026-06-30"), previous=prev, today=TODAY).ok
 
 
-def test_large_unexplained_move_rejected_but_explained_move_ok():
-    prev = snap(as_of_date="2026-06-30")
+def test_large_unexplained_move_held_but_explained_move_ok():
+    prev = snap(as_of="2026-06-30")
     half = snap(statement_total=None, holdings=[
         Holding(description="cash", value=prev.total * 0.5).model_dump()])
-    assert not validate(half, previous=prev, today=TODAY).ok
-    assert validate(half, previous=prev, today=TODAY, market_move=-0.45).ok
+    r = validate(half, previous=prev, today=TODAY)
+    assert r.ok and r.holds                      # held for approval, not rejected (C6)
+    assert not validate(half, previous=prev, today=TODAY, market_move=-0.45).holds
 
 
 # --- store (bitemporal) ------------------------------------------------------
