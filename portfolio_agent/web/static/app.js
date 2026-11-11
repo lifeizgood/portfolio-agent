@@ -269,7 +269,7 @@ async function loadAccounts() {
       <td>${esc(lg.cadence)}</td><td>${lg.has_credentials ? "yes" : "no"}</td>
       <td>${when(lg.last_fetched)}</td>
       <td class="row"><button data-act="edit">Edit</button>
-        <button class="primary" data-act="refresh" ${canRefresh ? "" : "disabled"}>Refresh</button>
+        <button class="primary" data-act="refresh" data-can="${canRefresh ? 1 : 0}" ${canRefresh ? "" : "disabled"}>Refresh</button>
         <span class="msg"></span></td>`;
     tr.querySelector("[data-act=edit]").addEventListener("click", () => openForm(lg));
     tr.querySelector("[data-act=refresh]").addEventListener("click", () =>
@@ -280,13 +280,41 @@ async function loadAccounts() {
     const lg = logins.find((x) => x.id === editing);
     if (lg) renderLoginAccounts(lg);
   }
+  syncRefreshButtons();
+}
+
+// Only one run at a time: while any refresh or nightly run is going, every Refresh
+// button is disabled, and they come back when it finishes.
+let refreshPoll = null, loginRefreshActive = false;
+function setRefreshButtons(busy) {
+  document.querySelectorAll("#login-list [data-act=refresh]").forEach((b) => {
+    b.disabled = busy || b.dataset.can !== "1";
+    b.title = busy ? "A refresh is already running" : "";
+  });
+  $("#refresh-btn").disabled = busy;
+}
+async function syncRefreshButtons() {
+  const s = await api("/api/summary");
+  const busy = s.running.length > 0;
+  setRefreshButtons(busy);
+  if (busy && !refreshPoll) {
+    refreshPoll = setInterval(async () => {
+      const t = await api("/api/summary");
+      if (!t.running.length) {
+        clearInterval(refreshPoll); refreshPoll = null;
+        setRefreshButtons(false);
+        if ($("#accounts").classList.contains("active") && !loginRefreshActive) loadAccounts();
+      }
+    }, 3000);
+  }
 }
 
 async function refreshLogin(lg, btn, msg) {
   msg.className = "msg";
+  loginRefreshActive = true;
+  setRefreshButtons(true);
   try {
     const { run_id } = await api(`/api/logins/${lg.id}/refresh`, { method: "POST" });
-    btn.disabled = true;
     while (true) {
       const r = await api(`/api/runs/${run_id}`);
       if (r.status !== "running") {
@@ -297,9 +325,10 @@ async function refreshLogin(lg, btn, msg) {
       msg.textContent = "refreshing… (signing in, capturing pages, then reading accounts)";
       await new Promise((res) => setTimeout(res, 2500));
     }
-    loadInboxBadge(); loadAccounts();
+    loadInboxBadge();
   } catch (err) { msg.textContent = err.message; msg.className = "msg err"; }
-  btn.disabled = false;
+  loginRefreshActive = false;
+  syncRefreshButtons();
 }
 
 function openForm(lg) {
