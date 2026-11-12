@@ -687,3 +687,282 @@ def test_stopped_run_keeps_the_page_it_stopped_on(conn, tmp_path):
     rid = run_logins(conn, "refresh", lambda: None, fetcher=stuck)
     item = store.get_run(conn, rid, detail=True)["items"][0]
     assert item["outcome"] == "stopped" and item["evidence"] == str(folder)
+
+
+# --- debts negative everywhere, rules on existing accounts, details pages, numbers ---
+
+def bofa_login(conn, **rules) -> int:
+    return add_login(conn, name="Bank of America", institution="Bank of America",
+                     login_url="https://www.bankofamerica.com", allowed_domains="bankofamerica.com",
+                     **rules)
+
+
+def test_debt_counts_negative_even_if_stored_positive(conn):
+    lid = bofa_login(conn, liability_categories=None)
+    card = registry.resolve_account(conn, registry.get_login(conn, lid), AccountRows(
+        account="Red", account_suffix="9001", category="Credit cards"))
+    registry.activate_account(conn, card["id"])
+    store.write_snapshot(conn, snap(institution="Bank of America", account="Red",
+                                   account_id=card["id"], statement_total=None,
+                                   holdings=[{"description": "Balance", "value": 700}]))
+    assert store.current_positions(conn)[0]["total"] == 700          # not a debt yet
+    lg = registry.get_login(conn, lid)
+    registry.save_login(conn, registry.LoginIn(**{**{k: lg[k] for k in (
+        "name", "institution", "login_url", "allowed_domains")},
+        "liability_categories": "Loans, Credit cards"}), lid)          # rule applied to old accounts
+    assert registry.get_account(conn, card["id"])["is_liability"]
+    p = store.current_positions(conn)[0]
+    assert p["total"] == -700 and p["holdings"][0]["value"] == -700
+    assert store.history(conn)[0]["total"] == -700
+    assert [o["value"] for o in store.holding_observations(conn)] == [-700]
+
+
+def test_category_count_next_to_heading_still_matches():
+    lg = {"skip_categories": "Investments", "liability_categories": "Loans"}
+    assert registry.skip_reason(lg, AccountRows(account="X", category="Investments 2"))
+    assert registry.is_liability_category(lg, AccountRows(account="Y", category="Loans1"))
+    assert not registry.skip_reason(lg, AccountRows(account="Z", category="Banking"))
+
+
+def test_skip_rule_excludes_existing_accounts_when_saved(conn):
+    lid = bofa_login(conn)
+    a = registry.resolve_account(conn, registry.get_login(conn, lid), AccountRows(
+        account="Kid - 529", account_suffix="4444", category="Investments"))
+    registry.activate_account(conn, a["id"])
+    lg = registry.get_login(conn, lid)
+    registry.save_login(conn, registry.LoginIn(**{**{k: lg[k] for k in (
+        "name", "institution", "login_url", "allowed_domains")}, "skip_categories": "Investments"}), lid)
+    assert registry.get_account(conn, a["id"])["status"] == "ignored"
+
+
+def test_two_accounts_given_one_number_are_rejected():
+    from portfolio_agent.schemas import Extraction
+    from portfolio_agent.validator import validate_extraction
+    ext = Extraction.model_validate({"as_of": "2026-11-10", "accounts": [
+        {"account": "Checking", "account_suffix": "5678", "holdings": [{"description": "B", "value": 1}]},
+        {"account": "Kid 529", "account_suffix": "5678", "holdings": [{"description": "B", "value": 2}]}]})
+    assert any("ending 5678" in e for e in validate_extraction(ext))
+
+
+def test_detail_links_are_same_site_and_safe():
+    from portfolio_agent.browser.portal import detail_links
+    links = detail_links([
+        {"label": "Checking - 1234", "href": "/myaccounts/details/deposit/account-details.go?adx=a"},
+        {"label": "Checking - 1234", "href": "/myaccounts/details/deposit/account-details.go?adx=a"},
+        {"label": "Red ...9001", "href": "javascript:void(0)"},
+        {"label": "CMA ...5555", "href": "https://www.merrilledge.com/details"},   # other site
+        {"label": "Make a payment", "href": "/myaccounts/details/pay"},           # never clicked
+        {"label": "Help", "href": "/help"},
+    ], "https://secure.bankofamerica.com/myaccounts/overview", ["bankofamerica.com"])
+    assert [l["label"] for l in links] == ["Checking - 1234", "Red ...9001"]
+    assert links[0]["url"].startswith("https://secure.bankofamerica.com/myaccounts/details/")
+    assert links[1]["url"] == ""                                           # clicked, not opened
+
+
+def test_corrected_account_number_keeps_the_same_account(conn, tmp_path):
+    lid = bofa_login(conn)
+    page = {"institution": "Bank of America", "as_of": "2026-11-10T16:00:00", "accounts": [
+        {"account": "Alex", "account_suffix": "7777", "category": "Banking",
+         "holdings": [{"description": "Balance", "value": 100}]}]}
+    model = FakeListChatModel(responses=[json.dumps(page)])
+    run_logins(conn, "refresh", lambda: model, fetcher=fake_fetcher(tmp_path))
+    for i in store.open_review_items(conn):
+        approve_held(conn, i["id"])
+    fixed = later({**page, "accounts": [{**page["accounts"][0], "account_suffix": "1212"}]})
+    model = FakeListChatModel(responses=[json.dumps(fixed)])
+    run_logins(conn, "refresh", lambda: model, fetcher=fake_fetcher(tmp_path))
+    accts = registry.get_login(conn, lid)["accounts"]
+    assert len(accts) == 1 and accts[0]["portal_suffix"] == "1212"
+    assert accts[0]["status"] == "active" and accts[0]["display_name"].endswith("…1212")
+    assert len(store.history(conn)) == 2
+
+
+# --- refreshes in parallel, one per institution -------------------------------------
+
+def test_refreshes_run_in_parallel_one_per_institution(tmp_path):
+    gate = threading.Event()
+
+    def slow_fetch(login, creds, ctx):      # holds the run open until the test releases it
+        gate.wait(10)
+        raise FetchStopped("not_found", "test stop")
+
+    app = create_app(str(tmp_path / "p.db"), model_loader=lambda: None, fetcher=slow_fetch)
+    c = TestClient(app)
+
+    def mk(name, inst, domain):
+        return c.post("/api/logins", headers=H, json={
+            "name": name, "institution": inst, "login_url": f"https://www.{domain}",
+            "allowed_domains": domain}).json()["id"]
+
+    bofa = mk("Bank of America", "Bank of America", "bankofamerica.com")
+    bofa2 = mk("BofA business", "Bank of America", "bankofamerica.com")
+    ml = mk("Merrill Lynch", "Merrill Lynch", "ml.com")
+    other = mk("Other", "Other Bank", "otherbank.com")
+    try:
+        assert c.post(f"/api/logins/{bofa}/refresh", headers=H).status_code == 200
+        busy = set(c.get("/api/summary").json()["busy_login_ids"])
+        assert busy == {bofa, bofa2}                       # same institution shares a browser
+        assert c.post(f"/api/logins/{bofa}/refresh", headers=H).status_code == 409
+        assert c.post(f"/api/logins/{bofa2}/refresh", headers=H).status_code == 409
+        assert c.post(f"/api/logins/{ml}/refresh", headers=H).status_code == 200   # in parallel
+        run = c.post("/api/refresh", headers=H).json()     # dashboard: only the free logins
+        assert json.loads(store.connect(tmp_path / "p.db").execute(
+            "SELECT login_ids FROM runs WHERE id=?", (run["run_id"],)).fetchone()[0]) == [other]
+        s = c.get("/api/summary").json()
+        assert not s["refresh_all_available"]
+        assert c.post("/api/refresh", headers=H).status_code == 409    # 3 running: the limit
+    finally:
+        gate.set()
+    deadline = time.time() + 10
+    while c.get("/api/summary").json()["running"] and time.time() < deadline:
+        time.sleep(0.05)
+    s = c.get("/api/summary").json()
+    assert s["busy_login_ids"] == [] and s["refresh_all_available"]
+
+
+# --- account numbers read by code from each account's details page -----------------
+
+def test_account_number_read_from_details_page():
+    from portfolio_agent.browser.portal import account_number_suffix
+    assert account_number_suffix("Adv Plus Banking\nAccount number: ****1234\nBalance $5") == "1234"
+    assert account_number_suffix("Acct # 0000 1111 2222 3333 Available") == "3333"
+    assert account_number_suffix("Red card\nCard ending in 9001\nStatement balance") == "9001"
+    assert account_number_suffix("Checking ...4321 Available balance") == "4321"
+    assert account_number_suffix("Account notes\nnothing here about numbers 2026") is None
+    long_page = "Savings\n" + "x" * 3100 + "\nCard ending 7777"     # only the top is read
+    assert account_number_suffix(long_page) is None
+
+
+def test_detail_links_include_accounts_known_by_name():
+    from portfolio_agent.browser.portal import detail_links
+    links = detail_links([
+        {"label": "Alex", "href": "/myaccounts/brain/redirect.go?target=x&adx=1"},
+        {"label": "Red", "href": "javascript:void(0)"},
+        {"label": "Rewards", "href": "/rewards"},
+    ], "https://secure.bankofamerica.com/myaccounts/overview", ["bankofamerica.com"],
+        known_names=["Alex", "Red"])
+    assert [l["label"] for l in links] == ["Alex", "Red"]
+
+
+def test_numbers_from_details_pages_override_the_model(conn, tmp_path):
+    lid = bofa_login(conn, open_account_details=True)
+    page = {"institution": "Bank of America", "as_of": "2026-11-10T16:00:00", "accounts": [
+        {"account": n, "account_suffix": "0X99", "category": c,
+         "holdings": [{"description": "Balance", "value": v}]}
+        for n, c, v in [("Alex", "Banking", 100), ("Red", "Credit cards", 50),
+                        ("Parents", "Banking", 20)]]}
+
+    def fetch(login, creds, ctx):
+        ev = fake_fetcher(tmp_path)(login, creds, ctx)
+        ev.details = [{"label": "Alex", "suffix": "1111"}, {"label": "Red ...9001", "suffix": "9001"},
+                      {"label": "Parents", "suffix": "2222"}]
+        return ev
+
+    model = FakeListChatModel(responses=[json.dumps(page)])   # the model gave all three 0X99
+    run_logins(conn, "refresh", lambda: model, fetcher=fetch)
+    got = {a["portal_name"]: a["portal_suffix"] for a in registry.get_login(conn, lid)["accounts"]}
+    assert got == {"Alex": "1111", "Red": "9001", "Parents": "2222"}
+
+
+# --- part-owned accounts (an LLC you own part of) ----------------------------
+
+def _llc_setup(conn):
+    lid = bofa_login(conn, liability_categories="Loans")
+    lg = registry.get_login(conn, lid)
+    ids = {}
+    for name, cat, value in (("LLC Checking", "Banking", 10000), ("LLC Loan", "Loans", 4000),
+                             ("Mine", "Banking", 500)):
+        a = registry.resolve_account(conn, lg, AccountRows(account=name, account_suffix=None, category=cat))
+        registry.activate_account(conn, a["id"])
+        ids[name] = a["id"]
+        for day in ("2026-03-31T16:00:00", "2026-09-30T16:00:00"):
+            store.write_snapshot(conn, snap(institution="Bank of America", account=name,
+                                           account_id=a["id"], statement_total=None, as_of=day,
+                                           holdings=[{"description": "Balance", "value": value}]))
+    o = registry.create_owner(conn, registry.OwnerIn(name="Acme LLC", pct=40, effective_from="2026-01-01"))
+    for name in ("LLC Checking", "LLC Loan"):
+        a = registry.get_account(conn, ids[name])
+        registry.update_account(conn, a["id"], registry.AccountEdit(
+            display_name=a["display_name"], account_type=a["account_type"], status="active",
+            is_liability=bool(a["is_liability"]), owner_id=o["id"]))
+    return o, ids
+
+
+def test_part_owned_accounts_count_at_your_share(conn):
+    o, ids = _llc_setup(conn)
+    pos = {p["account_id"]: p for p in store.current_positions(conn)}
+    assert pos[ids["LLC Checking"]]["total"] == pytest.approx(4000)
+    assert pos[ids["LLC Checking"]]["full_total"] == 10000
+    assert pos[ids["LLC Checking"]]["share_pct"] == 40
+    assert pos[ids["LLC Loan"]]["total"] == pytest.approx(-1600)    # the LLC's debt, your share
+    assert pos[ids["Mine"]]["total"] == 500 and pos[ids["Mine"]]["share_pct"] is None
+    full = {p["account_id"]: p["total"] for p in store.current_positions(conn, full=True)}
+    assert full[ids["LLC Checking"]] == 10000 and full[ids["LLC Loan"]] == -4000
+    # Stake changes to 50% from July: March keeps 40%, September uses 50%.
+    registry.add_owner_share(conn, o["id"], registry.OwnerShareIn(pct=50, effective_from="2026-07-01"))
+    h = [r for r in store.history(conn) if r["account_id"] == ids["LLC Checking"]]
+    assert [r["total"] for r in h] == [pytest.approx(4000), pytest.approx(5000)]
+    s = series.build_series(conn, granularity="monthly")
+    assert s["total"] == [pytest.approx(4000 - 1600 + 500), pytest.approx(5000 - 2000 + 500)]
+    assert series.build_series(conn, granularity="monthly", full=True)["total"] == [6500, 6500]
+    # View Source and the validator see the whole account, as the portal shows it.
+    sid = pos[ids["LLC Checking"]]["snapshot_id"]
+    assert store.get_snapshot(conn, sid)["total"] == 10000
+    assert store.get_snapshot(conn, sid)["share_pct"] == 50
+    prev = store.last_snapshot(conn, "Bank of America", "LLC Checking", ids["LLC Checking"])
+    assert prev.holdings[0].value == 10000
+    # A correction on the same date replaces the earlier entry.
+    registry.add_owner_share(conn, o["id"], registry.OwnerShareIn(pct=45, effective_from="2026-07-01"))
+    assert {p["account_id"]: p["share_pct"] for p in store.current_positions(conn)}[ids["LLC Checking"]] == 45
+
+
+def test_owner_in_use_cannot_be_deleted(conn):
+    o, ids = _llc_setup(conn)
+    with pytest.raises(ValueError, match="still belong"):
+        registry.delete_owner(conn, o["id"])
+    with pytest.raises(ValueError):
+        registry.OwnerShareIn(pct=0, effective_from="2026-01-01")
+
+
+def test_owner_api_and_net_worth(client):
+    conn = store.connect(client.db)
+    o, ids = _llc_setup(conn)
+    s = client.get("/api/summary").json()
+    assert s["net_worth"] == pytest.approx(4000 - 1600 + 500)
+    assert s["net_worth_full"] == pytest.approx(6500) and s["has_part_owned"]
+    full = client.get("/api/series?granularity=monthly&basis=full").json()
+    assert full["total"][-1] == pytest.approx(6500)
+    assert client.get("/api/series?basis=nope").status_code == 400
+    owners = client.get("/api/owners").json()
+    assert owners[0]["pct"] == 40 and len(owners[0]["accounts"]) == 2
+    r = client.post("/api/owners", json={"name": "Acme LLC", "pct": 10, "effective_from": "2026-01-01"},
+                    headers=H)
+    assert r.status_code == 400                                # duplicate name
+    r = client.post("/api/owners", json={"name": "Other LLC", "pct": 10, "effective_from": "2026-01-01"},
+                    headers=H)
+    assert r.status_code == 200
+    assert client.delete(f"/api/owners/{r.json()['id']}", headers=H).status_code == 200
+    assert client.delete(f"/api/owners/{o['id']}", headers=H).status_code == 400
+    a = client.get("/api/accounts").json()
+    assert {x["owner_name"] for x in a if x["id"] in (ids["LLC Checking"], ids["LLC Loan"])} == {"Acme LLC"}
+
+
+def test_number_shown_after_clicking_number_link():
+    from portfolio_agent.browser.portal import number_link, revealed_number_suffix
+    before = "Alex …5678\nBalance $1,200.00\nAccount & Routing Numbers\nTransactions"
+    after = before + "\nAccount number\n0000 1234 5678\nRouting number (ACH)\n123456780"
+    assert revealed_number_suffix(before, after) == "5678"
+    assert revealed_number_suffix(before, before) is None        # nothing shown: unread, not 5678
+    assert revealed_number_suffix("", "Routing number 123456780") is None
+    cl = [{"id": 1, "label": "Transfer", "href": "/transfer"},
+          {"id": 2, "label": "Account & Routing Numbers", "href": "#"},
+          {"id": 3, "label": "Sign out", "href": "/logout"}]
+    base = "https://secure.bankofamerica.com/myaccounts/details"
+    assert number_link(cl, "Account & Routing Numbers", base, ["bankofamerica.com"])["id"] == 2
+    assert number_link(cl, "Show full number", base, ["bankofamerica.com"]) is None
+
+
+def test_number_link_saved_in_playbook(conn):
+    lid = bofa_login(conn, account_number_link="Account & Routing Numbers")
+    assert registry.get_login(conn, lid)["account_number_link"] == "Account & Routing Numbers"
+    assert registry.steps_for(conn, "Bank of America")["account_number_link"] == "Account & Routing Numbers"

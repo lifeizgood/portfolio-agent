@@ -15,13 +15,14 @@ question / unknown prompt stop the branch, kill switch, time limit.
 import json
 import re
 import time
+from urllib.parse import urljoin
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Callable
 
 from .. import config, registry, store
 from ..timeutil import now, now_iso, to_iso
-from .guard import FetchStopped, Trace, classify_page, host_allowed
+from .guard import FetchStopped, Trace, check_click, classify_page, host_allowed
 from .navigator import navigate_to_holdings
 
 USERNAME_IN_FORM = "input[type=email], input[type=text], input[type=tel], input:not([type])"
@@ -63,6 +64,8 @@ class Evidence:
     captured_at: str
     proposal: dict | None = None     # playbook change for the user to approve
     trace: list = field(default_factory=list)
+    # Account details pages opened: [{"label": link text, "suffix": last 4 read by code}]
+    details: list = field(default_factory=list)
 
 
 @dataclass
@@ -229,6 +232,12 @@ def fetch_portal(login: dict, creds: dict | None, ctx: FetchContext) -> Evidence
                                 "change": {"holdings_urls": [result.url]},
                                 "why": "The navigator found the holdings page here. If some "
                                        "accounts are on other pages, add those URLs in Settings."}
+            if login.get("open_account_details"):
+                known = [a["portal_name"] for a in registry.list_accounts(ctx.conn)
+                         if a["login_id"] == login["id"] and a["status"] != "ignored"
+                         and a.get("portal_name")]
+                pages += _account_details(holder, pages, domains, trace, known,
+                                          steps.get("account_number_link"))
             return _save_evidence(pages, login, trace, proposal)
         except Exception as e:
             if holder is not None:   # keep the page it stopped on, for the Debug tab
@@ -492,6 +501,173 @@ def _two_factor(holder: _Holder, login: dict, ctx: FetchContext) -> None:
     holder.check()
 
 
+# A link to one account's own page: its URL names an account details/activity page,
+# or its label ends in a masked account number ("Checking - 1234", "Card ...1234").
+_DETAIL_HREF = re.compile(r"detail|activity|account-?summary", re.I)
+_MASKED_LABEL = re.compile(r"(?:\.{2,}|…|[xX*]{2,}|-)\s?[A-Z0-9]{4}\s*$")
+
+
+def _name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def link_name(label: str) -> str:
+    """A link's account name without a masked number after it ("Red ...1234" -> "red")."""
+    return _name(_MASKED_LABEL.sub("", label or ""))
+
+
+# The account number on an account's own page: "Account number: ****1234",
+# "Acct # ...1234", "ending in 1234", "Card ending 1234", "Checking - 1234".
+_ACCOUNT_NO = [
+    re.compile(r"(?:account|acct|card|loan)\s*(?:number\b|no\b\.?|num\b|#)\s*:?\s*[-x*•.…\s]*"
+               r"(?:[A-Z0-9]+[-\s]){0,3}([A-Z0-9]{4})\b", re.I),
+    re.compile(r"ending\s*(?:in|with)?\s*:?\s*[-x*•.…\s]*([A-Z0-9]{4})\b", re.I),
+    re.compile(r"(?:\.{2,}|…|[xX*•]{2,})\s?([A-Z0-9]{4})\b"),
+]
+
+
+def account_number_suffix(text: str) -> str | None:
+    """Last 4 of the account number on a details page, read by code (never the model).
+    Only the top of the page is read, so a number in the transaction list isn't picked up."""
+    top = (text or "")[:3000]
+    for pat in _ACCOUNT_NO:
+        m = pat.search(top)
+        if m and re.search(r"\d", m.group(1)):
+            return m.group(1).upper()
+    return None
+
+
+# Shown after clicking a link such as "Account & Routing Numbers": the full number,
+# e.g. "Account number 0000 1234 5678". Only the last 4 digits are kept anywhere.
+_SHOWN_NO = re.compile(r"(?:account|acct)\s*(?:number|no\b\.?|num\b|#)\s*:?\s*"
+                       r"([-x*•.…\s\d]{4,40})", re.I)
+
+
+def revealed_number_suffix(before: str, after: str) -> str | None:
+    """Last 4 digits of the account number that appeared after clicking the number link.
+    Text new since the click is searched first (the panel that opened), then the page.
+    A routing number is labelled as such and isn't matched."""
+    old = set((before or "").splitlines())
+    new = "\n".join(l for l in (after or "").splitlines() if l not in old)
+    for text in (new, after or ""):
+        for m in _SHOWN_NO.finditer(text):
+            digits = re.sub(r"\D", "", m.group(1))
+            if len(digits) >= 4:
+                return digits[-4:]
+    return None
+
+
+def number_link(clickables: list[dict], text: str, base_url: str, domains: list[str]) -> dict | None:
+    """The clickable whose label is the configured number link, if it's safe to click."""
+    want = _name(text)
+    for c in clickables:
+        label = (c.get("label") or "").strip()
+        if want and want in _name(label) and len(_name(label)) <= len(want) + 20:
+            href = (c.get("href") or "").strip()
+            url = urljoin(base_url, href) if href and not href.startswith(("javascript:", "#")) else ""
+            if url and not host_allowed(url, domains):
+                continue
+            if check_click(label, url, base_url, domains):
+                continue
+            return c
+    return None
+
+
+def detail_links(clickables: list[dict], base_url: str, domains: list[str],
+                 known_names: list[str] | None = None) -> list[dict]:
+    """Links on an overview page that open a single account's page, deduplicated.
+    A link counts if its URL names an account page, its label ends in a masked number,
+    or its label is the name of an account found on an earlier fetch.
+    Only same-site, safe links (never transfer/pay/sign-out and the like)."""
+    known = {_name(n) for n in known_names or [] if _name(n)}
+    out, seen = [], set()
+    for c in clickables:
+        href, label = (c.get("href") or "").strip(), (c.get("label") or "").strip()
+        if not label or not (_DETAIL_HREF.search(href) or _MASKED_LABEL.search(label)
+                             or link_name(label) in known):
+            continue
+        url = urljoin(base_url, href) if href and not href.startswith(("javascript:", "#")) else ""
+        if url and not host_allowed(url, domains):
+            continue              # e.g. a Merrill account on a Bank of America page
+        if check_click(label, url, base_url, domains):
+            continue
+        key = url or label
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"label": label, "url": url})
+    return out
+
+
+def _account_details(holder: _Holder, pages: list[dict], domains: list[str],
+                     trace: Trace, known_names: list[str] | None = None,
+                     number_link_text: str | None = None) -> list[dict]:
+    """Open each account's own page from the overview(s) and capture it.
+    With number_link_text, also click that link on each page (e.g. "Account & Routing
+    Numbers") and take the last 4 of the account number it shows; the full number is
+    never saved, traced or given to the model. A page that fails is skipped; the
+    overview values are still read."""
+    adapter, found = _PageAdapter(holder), []
+    for p in pages:
+        adapter.goto(p["url"])
+        for link in detail_links(adapter.clickables(), p["url"], domains, known_names):
+            found.append({**link, "from": p["url"]})
+    found = found[:config.MAX_DETAIL_PAGES]
+    trace.add("account_detail_links", count=len(found))
+    out, n = [], len(pages)
+    for link in found:
+        try:
+            if link["url"]:
+                adapter.goto(link["url"])
+            else:                 # script link: click it on its overview page
+                adapter.goto(link["from"])
+                target = next((c for c in adapter.clickables()
+                               if (c.get("label") or "").strip() == link["label"]), None)
+                if not target:
+                    trace.add("account_detail_missing", label=link["label"][:80])
+                    continue
+                adapter.click(target["id"])
+            if _classify(holder.page) != "ok":
+                trace.add("account_detail_stopped", label=link["label"][:80])
+                break             # signed out or a prompt appeared: keep what we have
+            n += 1
+            page = _capture_page(holder.page, n)
+            page["detail"] = True
+            page["label"] = link["label"]
+            if number_link_text:
+                page["suffix"] = _reveal_number(adapter, holder, page, number_link_text,
+                                                domains, link["label"], trace)
+            else:
+                page["suffix"] = account_number_suffix(page["text"])
+            out.append(page)
+            trace.add("account_detail_captured", label=link["label"][:80], url=page["url"],
+                      number_found=bool(page["suffix"]))
+        except FetchStopped:
+            raise
+        except Exception as e:
+            trace.add("account_detail_failed", label=link["label"][:80], error=type(e).__name__)
+    return out
+
+
+def _reveal_number(adapter, holder: _Holder, page: dict, link_text: str,
+                   domains: list[str], label: str, trace: Trace) -> str | None:
+    """Click the number link on a captured details page and read the last 4 it shows.
+    No fallback to the page's own masked number: for these portals it's a different
+    number, so a miss leaves the number unread rather than wrong."""
+    target = number_link(adapter.clickables(), link_text, page["url"], domains)
+    if not target:
+        trace.add("account_number_link_missing", label=label[:80], link=link_text[:80])
+        return None
+    adapter.click(target["id"])
+    try:
+        holder.page.wait_for_timeout(1500)       # panels often animate open
+    except Exception:
+        pass
+    suffix = revealed_number_suffix(page["text"], _body_text(holder.page))
+    trace.add("account_number_link_clicked", label=label[:80], number_found=bool(suffix))
+    return suffix
+
+
 def _check_login_cap(ctx: FetchContext, login: dict) -> None:
     if ctx.run_kind != "nightly":
         return   # Refresh limits are to be set over time (spec C15)
@@ -534,7 +710,13 @@ def _save_evidence(pages: list[dict], login: dict, trace: Trace,
         (folder / f"{stem}.png").write_bytes(p["png"])
         (folder / f"{stem}.html").write_text(p["html"], encoding="utf-8")
         (folder / f"{stem}.txt").write_text(p["text"], encoding="utf-8")
-        texts.append(p["text"] if len(pages) == 1 else f"=== Page {p['n']}: {p['url']} ===\n{p['text']}")
+        if p.get("detail"):   # name, number and balance are at the top; transactions follow
+            number = f", account number ending {p['suffix']}" if p.get("suffix") else ""
+            texts.append(f"=== Account details page {p['n']} for {p['label']!r}{number}: "
+                         f"{p['url']} ===\n" + p["text"][:config.DETAIL_PAGE_CHARS])
+        else:
+            texts.append(p["text"] if len(pages) == 1
+                         else f"=== Page {p['n']}: {p['url']} ===\n{p['text']}")
     (folder / "meta.json").write_text(json.dumps(
         {"pages": [p["url"] for p in pages], "captured_at": captured_at, "login": login["name"]},
         indent=2))
@@ -546,8 +728,11 @@ def _save_evidence(pages: list[dict], login: dict, trace: Trace,
                            f"over the {config.PAGE_MAX_CHARS:,} limit. Cutting it would drop "
                            "accounts, so nothing was read. Raise PA_PAGE_MAX_CHARS or save "
                            "narrower holdings pages under the login steps.")
+    details = [{"label": p["label"], "suffix": p["suffix"]} for p in pages if p.get("detail")]
+    if details:
+        (folder / "details.json").write_text(json.dumps(details, indent=2))
     return Evidence(text=text, folder=str(folder), url=pages[0]["url"], captured_at=captured_at,
-                    proposal=proposal, trace=trace.steps)
+                    proposal=proposal, trace=trace.steps, details=details)
 
 
 def open_browser_for_manual_login(login: dict) -> None:

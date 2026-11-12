@@ -4,6 +4,7 @@ Everything else in the repo only calls `model.invoke(messages).content`, so test
 can swap in a fake model and you can swap in a different backend later.
 """
 
+import threading
 from functools import lru_cache
 
 from . import config
@@ -19,9 +20,33 @@ def pick_device() -> str:
     return "cpu"
 
 
-@lru_cache(maxsize=2)
+_LOAD_LOCK = threading.Lock()   # parallel refreshes must not load the model twice
+_GEN_LOCK = threading.Lock()    # one generation at a time on the GPU
+
+
+class _OneAtATime:
+    """The model, shared by parallel refreshes: calls take turns (browsing still
+    runs in parallel; only reading pages with the model waits)."""
+
+    def __init__(self, model):
+        self._model = model
+
+    def invoke(self, *args, **kwargs):
+        with _GEN_LOCK:
+            return self._model.invoke(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
+
+
 def load_chat_model(model_id: str | None = None, max_new_tokens: int | None = None):
-    """Download (first run only) and load the model. Cached per process."""
+    """Download (first run only) and load the model, once per process."""
+    with _LOAD_LOCK:
+        return _load(model_id, max_new_tokens)
+
+
+@lru_cache(maxsize=2)
+def _load(model_id: str | None, max_new_tokens: int | None):
     from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
     from transformers import AutoTokenizer, pipeline
 
@@ -38,4 +63,4 @@ def load_chat_model(model_id: str | None = None, max_new_tokens: int | None = No
         return_full_text=False,    # only the new text, not the prompt
     )
     llm = HuggingFacePipeline(pipeline=pipe, model_id=model_id)
-    return ChatHuggingFace(llm=llm, tokenizer=tokenizer, model_id=model_id)
+    return _OneAtATime(ChatHuggingFace(llm=llm, tokenizer=tokenizer, model_id=model_id))

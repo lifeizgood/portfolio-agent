@@ -44,6 +44,8 @@
       <label>View <select id="granularity"><option value="daily">Daily</option><option value="monthly">Monthly</option></select></label>
       <label>Split by <select id="group"><option value="account">Account</option><option value="institution">Institution</option><option value="type">Type</option></select></label>
       <label title="Show the history using only values retrieved by this date">As known on <input type="date" id="known-on"></label>
+      <div id="basis-wrap" class="basis" hidden title="Accounts held by an entity you own part of (an LLC): count your percentage, or the whole account">Values
+        <span class="seg" id="basis"><button data-b="share" class="on">Your share</button><button data-b="full">Full value</button></span></div>
     </div>
     <div class="chart-wrap"><canvas id="chart"></canvas></div>
     <p id="chart-empty" class="muted" hidden>No values yet. Add a login under Accounts &amp; logins, then press Refresh.</p>
@@ -52,7 +54,17 @@
   <div class="card">
     <h2>Accounts</h2>
     <table id="positions"><thead><tr><th>Account</th><th>Login</th><th>Status</th>
-      <th class="num">Value</th><th>As of</th><th>Retrieved</th><th></th></tr></thead><tbody></tbody></table>
+      <th class="num">Value</th><th>As of</th><th>Retrieved</th><th></th></tr>
+      <tr class="filters">
+        <th><input data-f="account" placeholder="Filter" aria-label="Filter accounts"></th>
+        <th><input data-f="login" placeholder="Filter" aria-label="Filter logins"></th>
+        <th><select data-f="status" aria-label="Filter status"><option value="">All</option></select></th>
+        <th><input data-f="value" placeholder="e.g. &gt;1000" title="&gt;1000, &lt;0, &gt;=500, =0, or a range 1000..5000" aria-label="Filter value"></th>
+        <th><select data-f="asof" aria-label="Filter as-of date"><option value="">Any</option><option value="d1">Last 24 hours</option><option value="d7">Last 7 days</option><option value="d30">Last 30 days</option><option value="o7">Older than 7 days</option><option value="o30">Older than 30 days</option></select></th>
+        <th><select data-f="retrieved" aria-label="Filter retrieved date"><option value="">Any</option><option value="d1">Last 24 hours</option><option value="d7">Last 7 days</option><option value="d30">Last 30 days</option><option value="o7">Older than 7 days</option><option value="o30">Older than 30 days</option></select></th>
+        <th><button type="button" class="link" id="positions-clear" hidden>Clear filters</button></th>
+      </tr></thead><tbody></tbody>
+      <tfoot><tr><td colspan="3" id="positions-count" class="muted"></td><td class="num" id="positions-total"></td><td colspan="3"></td></tr></tfoot></table>
   </div>
 
   <div class="card" id="holdings-card" hidden>
@@ -91,6 +103,18 @@
     <button id="new-login">Add login</button>
   </div>
 
+  <div class="card" id="owners-card">
+    <h2>Part-owned entities</h2>
+    <p class="muted">For accounts held by an entity you own part of, such as an LLC. Add the entity and your percentage here, then pick it under <b>Owned by</b> for each of its accounts (open the login with Edit). Those accounts, including the entity's loans and cards, count at your percentage in net worth and the chart; their stored values and View Source stay as the portal shows them. A change of percentage applies from its date, so earlier months keep the old one; the first percentage also covers earlier history.</p>
+    <table id="owner-list"><thead><tr><th>Entity</th><th class="num">Your share now</th><th>Changes</th><th>Accounts</th><th></th></tr></thead><tbody></tbody></table>
+    <form id="owner-form" class="controls" autocomplete="off" style="margin-top:12px">
+      <label>Entity <input name="name" required maxlength="80" placeholder="e.g. Acme Holdings LLC"></label>
+      <label>Your share % <input name="pct" type="number" required min="0.01" max="100" step="any" style="width:90px"></label>
+      <label>From <input name="effective_from" type="date" required></label>
+      <button type="submit" class="primary">Add entity</button><span id="owner-msg" class="msg"></span>
+    </form>
+  </div>
+
   <div class="card" id="login-form-card" hidden>
     <h2 id="login-form-title">Add login</h2>
     <form id="login-form" autocomplete="off">
@@ -115,6 +139,8 @@
           <label>Skip these categories<input name="skip_categories" placeholder="e.g. Investments (already fetched by another login)"></label>
           <label>Debts: store as negative<input name="liability_categories" placeholder="e.g. Loans, Credit cards"></label>
           <label class="check"><input type="checkbox" name="skip_other_institutions"> Skip accounts the page shows as held at another institution (e.g. Merrill on a Bank of America page)</label>
+          <label class="check"><input type="checkbox" name="open_account_details"> Open each account's details page to read its exact name and account number (use when the overview shows only nicknames)</label>
+          <label>On each details page, click this to show the account number<input name="account_number_link" maxlength="80" placeholder="e.g. Account &amp; Routing Numbers (blank = read the page as it is)"></label>
         </div>
       </details>
       <details><summary>Login steps (optional; blank = detect automatically)</summary>
@@ -146,8 +172,21 @@
 
       <h3>Accounts under this login</h3>
       <p class="muted">Found automatically on each fetch. The first time an account is seen, the Inbox asks whether to include it. <b>Excluded</b> accounts are left out of every future fetch, chart and total; change it here at any time.</p>
-      <table id="login-accounts"><thead><tr><th>Display name</th><th>As shown on the portal</th><th>Category</th><th>Type</th>
-        <th>In portfolio?</th><th>Debt (negative)</th><th>Closed on</th><th></th></tr></thead><tbody></tbody></table>
+      <div class="controls" id="acct-filters">
+        <span class="muted">Show:</span>
+        <label><input type="checkbox" value="active" checked> Included</label>
+        <label><input type="checkbox" value="ignored" checked> Excluded</label>
+        <label><input type="checkbox" value="pending" checked> Not decided yet</label>
+        <label><input type="checkbox" value="closed" checked> Closed</label>
+        <label>Balance over $<input id="acct-min" type="number" min="0" step="any" placeholder="any" style="width:110px"></label>
+        <span id="acct-count" class="muted"></span>
+        <button type="button" class="primary save-accounts" disabled>Save changes</button>
+      </div>
+      <table id="login-accounts"><thead><tr><th>Display name</th><th>As shown on the portal</th><th>Category</th><th class="num">Balance</th><th>Type</th>
+        <th>In portfolio?</th><th>Debt (negative)</th><th title="An entity you own part of; the account counts at your percentage">Owned by</th><th>Closed on</th><th></th></tr></thead><tbody></tbody></table>
+      <div class="row"><button type="button" class="primary save-accounts" disabled>Save changes</button>
+        <button type="button" id="discard-accounts" disabled>Discard changes</button>
+        <span id="accounts-save-msg" class="msg"></span></div>
     </div>
   </div>
 </section>

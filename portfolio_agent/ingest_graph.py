@@ -45,6 +45,26 @@ class IngestState(TypedDict, total=False):
     outcome: str              # stored | held | review | mixed
     snapshot_id: int
     review_id: int
+    details: list[dict]       # account details pages: [{label, suffix}], number read by code
+
+
+def apply_detail_numbers(ext: Extraction, details: list[dict]) -> Extraction:
+    """An account's number comes from its own details page, read by code, not from
+    the model: the account whose name is the link that was clicked gets that page's
+    last 4. Only exact, one-to-one name matches are used."""
+    from .browser.portal import link_name
+    by_name: dict[str, set] = {}
+    for d in details:
+        if d.get("suffix"):
+            by_name.setdefault(link_name(d["label"]), set()).add(d["suffix"])
+    accounts = []
+    for rows in ext.accounts:
+        found = by_name.get(link_name(rows.account), set())
+        if len(found) == 1 and sum(link_name(r.account) == link_name(rows.account)
+                                   for r in ext.accounts) == 1:
+            rows = rows.model_copy(update={"account_suffix": next(iter(found))})
+        accounts.append(rows)
+    return ext.model_copy(update={"accounts": accounts})
 
 
 def _snapshot(ext: Extraction, rows, institution: str, source: str,
@@ -114,6 +134,7 @@ def build_ingest_graph(model, conn, today=None):
                           captured_at=state["retrieved_at"] if state.get("source") == "portal" else None)
         except ExtractionError as e:
             return {"extraction": None, "errors": [str(e)], "attempts": attempts}
+        ext = apply_detail_numbers(ext, state.get("details") or [])
         if ext.as_of_datetime is None:   # no date shown: use the capture time (spec D16)
             ext = ext.model_copy(update={"as_of_datetime": parse_iso(state["retrieved_at"])})
         return {"extraction": ext.model_dump(mode="json"), "attempts": attempts}
@@ -158,6 +179,9 @@ def build_ingest_graph(model, conn, today=None):
         login = state.get("login")
         inst = login["institution"] if login else (ext.institution or state.get("institution") or "")
         results = []
+        if login:   # an account whose number was misread before keeps its entry
+            registry.relink_accounts(conn, login, [r for r in ext.accounts if not r.closed
+                                                   and not registry.skip_reason(login, r)])
         for rows in ext.accounts:
             why = registry.skip_reason(login, rows) if login else None
             if why:   # a login rule leaves it out (e.g. Merrill accounts on a Bank of America page)

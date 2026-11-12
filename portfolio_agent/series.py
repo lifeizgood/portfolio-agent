@@ -27,10 +27,10 @@ def _hkey(symbol: str | None, description: str) -> str:
     return (symbol or "").upper() or "d:" + re.sub(r"[^a-z0-9]", "", description.lower())
 
 
-def _points(conn, known_on: str | None = None) -> dict[int, dict]:
+def _points(conn, known_on: str | None = None, full: bool = False) -> dict[int, dict]:
     accounts = {a["id"]: a for a in registry.list_accounts(conn)}
     by_acct: dict[int, dict] = {}
-    for r in store.holding_observations(conn, known_on):
+    for r in store.holding_observations(conn, known_on, full):   # your share unless full
         a = accounts.get(r["account_id"])
         if not a or a["status"] in ("ignored", "pending"):
             continue          # only accounts you track; test data has no account
@@ -77,8 +77,8 @@ def _data_days(pts: dict) -> list[date]:
 
 def build_series(conn, start: date | None = None, end: date | None = None,
                  granularity: str = "daily", group: str = "account",
-                 known_on: str | None = None) -> dict:
-    pts = _points(conn, known_on)
+                 known_on: str | None = None, full: bool = False) -> dict:
+    pts = _points(conn, known_on, full)
     if not pts:
         return {"dates": [], "series": {}, "total": [], "carried": {}}
     all_days = _data_days(pts)

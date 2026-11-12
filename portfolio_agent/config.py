@@ -36,11 +36,18 @@ STEP_BUDGET = int(os.getenv("PA_STEP_BUDGET", "8"))
 FETCH_STEP_BUDGET = int(os.getenv("PA_FETCH_STEPS", "25"))         # LLM navigation steps
 FETCH_TIMEOUT_S = int(os.getenv("PA_FETCH_TIMEOUT", "300"))        # placeholder, spec D10
 MAX_LOGINS_PER_NIGHT = int(os.getenv("PA_MAX_LOGINS", "2"))        # per portal, nightly run
+MAX_PARALLEL_RUNS = int(os.getenv("PA_MAX_PARALLEL", "3"))          # refreshes at once (spec §4)
 TWOFA_WAIT_S = int(os.getenv("PA_2FA_WAIT", "300"))                # wait for the user's code
 HEADLESS = os.getenv("PA_HEADLESS", "0") == "1"                    # portals often block headless
 # SMS 2FA: the Messages database, read-only, and how long to wait for the text.
 MESSAGES_DB = Path(os.getenv("PA_MESSAGES_DB", Path.home() / "Library" / "Messages" / "chat.db"))
 SMS_WAIT_S = int(os.getenv("PA_SMS_WAIT", "120"))
+
+# Account details pages (opened when a login's "open each account's details page" is on):
+# at most this many per fetch, and only the top of each (name, number, balance) goes to
+# the extractor. The whole page, transactions included, is kept as evidence.
+MAX_DETAIL_PAGES = int(os.getenv("PA_MAX_DETAIL_PAGES", "20"))
+DETAIL_PAGE_CHARS = int(os.getenv("PA_DETAIL_PAGE_CHARS", "4000"))
 
 # Page text handed to the extractor. Long portal pages list some accounts far down;
 # cutting them off loses those accounts, so the limit is generous.

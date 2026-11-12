@@ -114,6 +114,18 @@ CREATE TABLE IF NOT EXISTS run_items (
     detail       TEXT,
     trace        TEXT                  -- JSON list of steps; never contains secrets
 );
+CREATE TABLE IF NOT EXISTS owners (            -- e.g. an LLC you own part of
+    id           INTEGER PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    created_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS owner_shares (      -- your percentage, from a date; never rewritten
+    id             INTEGER PRIMARY KEY,
+    owner_id       INTEGER NOT NULL REFERENCES owners(id),
+    pct            REAL NOT NULL,              -- 0 < pct <= 100
+    effective_from TEXT NOT NULL,              -- local date
+    recorded_at    TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS login_attempts (
     id           INTEGER PRIMARY KEY,
     account_id   INTEGER NOT NULL,
@@ -131,13 +143,15 @@ _MIGRATIONS = {
     # One login holds many accounts; each account keeps its own history.
     "accounts": {"login_id": "INTEGER", "portal_key": "TEXT", "portal_name": "TEXT",
                  "portal_suffix": "TEXT", "category": "TEXT",
-                 "is_liability": "INTEGER NOT NULL DEFAULT 0"},   # stored as negative values
+                 "is_liability": "INTEGER NOT NULL DEFAULT 0",    # stored as negative values
+                 "owner_id": "INTEGER"},       # held by a part-owned entity; NULL = you, 100%
     # Per-login rules: which listed accounts to skip, which are debts.
     "logins": {"skip_categories": "TEXT", "liability_categories": "TEXT",
-               "skip_other_institutions": "INTEGER NOT NULL DEFAULT 0"},
+               "skip_other_institutions": "INTEGER NOT NULL DEFAULT 0",
+               "open_account_details": "INTEGER NOT NULL DEFAULT 0"},
     "run_items": {"login_id": "INTEGER", "evidence": "TEXT"},
     "login_attempts": {"login_id": "INTEGER"},
-    "runs": {"pid": "INTEGER"},
+    "runs": {"pid": "INTEGER", "login_ids": "TEXT"},   # logins the run covers (JSON list)
     "holdings": {"price_as_of": "TEXT"},   # a holding's own as-of date, when it has one       # process doing the run, to spot orphaned runs
 }
 
@@ -159,7 +173,8 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     path = Path(path or config.DB_PATH)
     if str(path) != ":memory:":
         path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    # Parallel refreshes write from several threads: wait for a lock rather than fail.
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     _migrate(conn)
@@ -261,30 +276,107 @@ def previous_snapshot(conn, snap: Snapshot) -> Snapshot | None:
     return _to_snapshot(conn, row) if row else None
 
 
+# --- debts -------------------------------------------------------------------
+# A debt account (loan, credit card) is owed, so its values count as negative.
+# The sign is applied when values are read, from the account's debt flag, so
+# values stored before the flag was set (as positive numbers) count correctly
+# too, and the stored rows are never rewritten.
+
+def debt_accounts(conn) -> set[int]:
+    return {r[0] for r in conn.execute("SELECT id FROM accounts WHERE is_liability = 1")}
+
+
+def signed(value, debt: bool):
+    """A debt's value is always negative; other values are left as stored."""
+    return -abs(value) if debt and value else value     # no "-0" for a paid-off debt
+
+
+# --- part-owned accounts -----------------------------------------------------
+# An account held by an entity you own part of (an LLC) is stored at the full
+# value the portal shows; your percentage is applied when values are read, like
+# the debt sign. A percentage applies from its date; the first one also covers
+# earlier history. "full" readers skip it (View Source, the validator, the
+# Full value view).
+
+def share_rules(conn) -> dict[int, list[tuple[str, float]]]:
+    """account id -> [(effective_from, fraction)] by date, for part-owned accounts."""
+    by_owner: dict[int, list] = {}
+    for r in conn.execute("SELECT owner_id, pct, effective_from FROM owner_shares"
+                          " ORDER BY effective_from, recorded_at, id"):
+        steps = by_owner.setdefault(r["owner_id"], [])
+        if steps and steps[-1][0] == r["effective_from"]:
+            steps[-1] = (r["effective_from"], r["pct"] / 100)   # a later entry corrects it
+        else:
+            steps.append((r["effective_from"], r["pct"] / 100))
+    return {r["id"]: by_owner.get(r["owner_id"], [])
+            for r in conn.execute("SELECT id, owner_id FROM accounts WHERE owner_id IS NOT NULL")}
+
+
+def share_on(rules: dict, account_id, day: str | None) -> float:
+    """Your fraction of an account on a local date (1.0 unless part-owned)."""
+    steps = rules.get(account_id)
+    if not steps:
+        return 1.0
+    f = steps[0][1]
+    for eff, frac in steps:
+        if day and eff <= day[:10]:
+            f = frac
+        elif day:
+            break
+    return f
+
+
+class _Values:
+    """Applies the debt sign and, unless full, your share, to stored values."""
+
+    def __init__(self, conn, full: bool = False):
+        self.debts = debt_accounts(conn)
+        self.all_rules = share_rules(conn)
+        self.rules = {} if full else self.all_rules
+
+    def full(self, value, account_id):
+        return signed(value, account_id in self.debts)
+
+    def __call__(self, value, account_id, day):
+        v = self.full(value, account_id)
+        return v * share_on(self.rules, account_id, day) if v else v
+
+    def pct(self, account_id, day):
+        """Your percentage when below 100, else None (whichever view is shown)."""
+        f = share_on(self.all_rules, account_id, day)
+        return round(f * 100, 4) if f < 1 else None
+
+
 def has_any_snapshot(conn, snap: Snapshot) -> bool:
     where, args = _key_args(snap)
     return conn.execute(f"SELECT 1 FROM snapshots WHERE {where} LIMIT 1", args).fetchone() is not None
 
 
-def current_positions(conn) -> list[dict]:
-    """Latest known snapshot per account, with its timestamps for display."""
+def current_positions(conn, full: bool = False) -> list[dict]:
+    """Latest known snapshot per account, with its timestamps for display.
+    total is your share (full=False) or the whole account; full_total is always
+    the whole account, and holdings are as the portal shows them."""
     rows = conn.execute(
         f"SELECT * FROM ({_CURRENT}) c WHERE as_of_datetime = ("
         f"  SELECT MAX(as_of_datetime) FROM snapshots x WHERE {_KEY.format(t='x')} = c.acct_key)"
         " ORDER BY institution, account").fetchall()
-    out = []
+    out, val = [], _Values(conn, full)
     for r in rows:
         snap = _to_snapshot(conn, r)
+        day = r["as_of_date"]
         out.append({"snapshot_id": r["id"], "account_id": r["account_id"],
                     "institution": r["institution"], "account": r["account"],
                     "as_of_date": r["as_of_date"], "as_of_datetime": r["as_of_datetime"],
                     "retrieved_at": r["retrieved_at"], "source": r["source"],
-                    "total": r["total"], "has_evidence": bool(r["evidence"]),
+                    "total": val(r["total"], r["account_id"], day),
+                    "full_total": val.full(r["total"], r["account_id"]),
+                    "share_pct": val.pct(r["account_id"], day),
+                    "has_evidence": bool(r["evidence"]),
                     "holdings": [h.model_dump() for h in snap.holdings]})
     return out
 
 
-def history(conn, account: str | None = None) -> list[dict]:
+def history(conn, account: str | None = None, full: bool = False) -> list[dict]:
     """Value over time by as-of (latest retrieval of each)."""
     sql = (f"SELECT id AS snapshot_id, acct_key, account_id, institution, account, as_of_date,"
            f" as_of_datetime, retrieved_at, total FROM ({_CURRENT})")
@@ -293,10 +385,10 @@ def history(conn, account: str | None = None) -> list[dict]:
         sql += " WHERE account = ?"
         args = (account,)
     sql += " ORDER BY as_of_datetime, institution, account"
-    return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    return _value_totals(conn, [dict(r) for r in conn.execute(sql, args).fetchall()], full)
 
 
-def history_known_on(conn, known_on_iso: str) -> list[dict]:
+def history_known_on(conn, known_on_iso: str, full: bool = False) -> list[dict]:
     """History using only values retrieved by a past moment ("as known on")."""
     rows = conn.execute(
         f"SELECT s.id AS snapshot_id, {_KEY.format(t='s')} AS acct_key, s.account_id,"
@@ -307,15 +399,27 @@ def history_known_on(conn, known_on_iso: str) -> list[dict]:
         "    AND s2.as_of_datetime = s.as_of_datetime AND s2.retrieved_at <= ?"
         "  ORDER BY s2.retrieved_at DESC, s2.id DESC LIMIT 1)"
         " ORDER BY s.as_of_datetime", (known_on_iso,)).fetchall()
-    return [dict(r) for r in rows]
+    return _value_totals(conn, [dict(r) for r in rows], full)
+
+
+def _value_totals(conn, rows: list[dict], full: bool = False) -> list[dict]:
+    val = _Values(conn, full)
+    for r in rows:
+        r["full_total"] = val.full(r["total"], r["account_id"])
+        r["total"] = val(r["total"], r["account_id"], r["as_of_date"])
+    return rows
 
 
 def get_snapshot(conn, snapshot_id: int) -> dict | None:
     row = conn.execute("SELECT * FROM snapshots WHERE id=?", (snapshot_id,)).fetchone()
     if not row:
         return None
-    snap = _to_snapshot(conn, row)
-    return {**dict(row), "holdings": [h.model_dump() for h in snap.holdings]}
+    snap = _to_snapshot(conn, row)      # View Source: the whole account, as on the portal
+    val = _Values(conn, full=True)
+    return {**dict(row), "total": val.full(row["total"], row["account_id"]),
+            "share_pct": val.pct(row["account_id"], row["as_of_date"]),
+            "statement_total": snap.statement_total,
+            "holdings": [h.model_dump() for h in snap.holdings]}
 
 
 def _to_snapshot(conn, row) -> Snapshot:
@@ -323,11 +427,13 @@ def _to_snapshot(conn, row) -> Snapshot:
         "SELECT symbol, description, quantity, price, value, price_as_of FROM holdings"
         " WHERE snapshot_id=?",
         (row["id"],)).fetchall()
+    debt = row["account_id"] in debt_accounts(conn)
+    holdings = [Holding(**{**dict(h), "value": signed(h["value"], debt)}) for h in hs]
     return Snapshot(institution=row["institution"], account=row["account"],
                     account_id=row["account_id"],
                     as_of_datetime=row["as_of_datetime"] or row["as_of_date"],
-                    statement_total=row["statement_total"],
-                    source=row["source"], holdings=[Holding(**dict(h)) for h in hs])
+                    statement_total=signed(row["statement_total"], debt),
+                    source=row["source"], holdings=holdings)
 
 
 # --- inbox (review queue) ----------------------------------------------------
@@ -538,6 +644,26 @@ def last_run(conn, kind: str | None = None) -> dict | None:
     return get_run(conn, r["id"]) if r else None
 
 
+def set_run_logins(conn, run_id: int, login_ids: list[int]) -> None:
+    conn.execute("UPDATE runs SET login_ids=? WHERE id=?", (json.dumps(login_ids), run_id))
+    conn.commit()
+
+
+def busy_login_ids(conn) -> set[int]:
+    """Logins a running run covers, or is about to, plus every other login at the same
+    institution: logins at one institution share a browser profile, which only one
+    browser can open at a time. A run that doesn't say which logins it covers (one
+    just starting, or from older code) blocks every login."""
+    logins = {r["id"]: r["institution"] for r in conn.execute("SELECT id, institution FROM logins")}
+    busy: set[int] = set()
+    for r in running_runs(conn):
+        if not r.get("login_ids"):
+            return set(logins)
+        busy |= set(json.loads(r["login_ids"]))
+    insts = {logins.get(i) for i in busy}
+    return {i for i, inst in logins.items() if i in busy or inst in insts}
+
+
 def running_runs(conn) -> list[dict]:
     expire_dead_runs(conn)
     return [dict(r) for r in conn.execute("SELECT * FROM runs WHERE status='running'")]
@@ -619,10 +745,11 @@ def redate_stale_portal_values(conn, max_age_days: int) -> list[dict]:
     return fixed
 
 
-def holding_observations(conn, known_on_iso: str | None = None) -> list[dict]:
+def holding_observations(conn, known_on_iso: str | None = None, full: bool = False) -> list[dict]:
     """Every stored holding row with its snapshot's timing, for registered accounts.
-    known_on_iso limits it to what had been retrieved by then ("as known on")."""
-    sql = ("SELECT s.id AS snapshot_id, s.account_id, s.as_of_datetime, s.retrieved_at,"
+    known_on_iso limits it to what had been retrieved by then ("as known on").
+    Values are your share unless full."""
+    sql = ("SELECT s.id AS snapshot_id, s.account_id, s.as_of_date, s.as_of_datetime, s.retrieved_at,"
            " h.symbol, h.description, h.value, h.price_as_of"
            " FROM holdings h JOIN snapshots s ON s.id = h.snapshot_id"
            " WHERE s.account_id IS NOT NULL")
@@ -630,4 +757,6 @@ def holding_observations(conn, known_on_iso: str | None = None) -> list[dict]:
     if known_on_iso:
         sql += " AND s.retrieved_at <= ?"
         args = (known_on_iso,)
-    return [dict(r) for r in conn.execute(sql + " ORDER BY s.as_of_datetime, s.id", args)]
+    val = _Values(conn, full)
+    return [{**dict(r), "value": val(r["value"], r["account_id"], r["as_of_date"])}
+            for r in conn.execute(sql + " ORDER BY s.as_of_datetime, s.id", args)]

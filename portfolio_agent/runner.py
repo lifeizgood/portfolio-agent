@@ -41,7 +41,9 @@ def run_logins(conn, kind: str, model_loader: Callable[[], object],
         return run_id
 
     counts: dict[str, int] = {}
-    for login in select_logins(conn, kind, login_ids):
+    chosen = select_logins(conn, kind, login_ids)
+    store.set_run_logins(conn, run_id, [lg["id"] for lg in chosen])
+    for login in chosen:
         item = store.start_run_item(conn, run_id, login["id"])
         ctx = FetchContext(conn=conn, run_kind=kind, model_loader=model_loader,
                            request_code=lambda reason, lg=login: _ask_for_code(conn, lg, reason))
@@ -55,7 +57,8 @@ def run_logins(conn, kind: str, model_loader: Callable[[], object],
             graph = build_ingest_graph(model_loader(), conn)
             out = graph.invoke({"text": ev.text, "evidence": ev.folder, "login": login,
                                 "source": "portal", "run_id": run_id,
-                                "retrieved_at": ev.captured_at})
+                                "retrieved_at": ev.captured_at,
+                                "details": getattr(ev, "details", None) or []})
             outcome = out["outcome"]
             if out.get("results"):
                 detail = "; ".join(f"{r['account']}: {r['outcome']}" for r in out["results"])

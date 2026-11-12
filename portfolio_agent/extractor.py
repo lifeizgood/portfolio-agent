@@ -23,6 +23,9 @@ A document may show SEVERAL accounts (for example a brokerage account, an IRA an
 - including accounts with small or zero balances.
 Never drop an account to make the numbers match a total.
 For loans, credit cards and other debts, give the balance owed as a POSITIVE number.
+Pages headed "=== Account details" each show ONE account that is also on the overview
+page: keep the account name the overview shows, take the account number and current
+balance from its details page, and still list each account only once. Transactions on those pages are history, not holdings.
 Return ONLY one JSON object, no prose, with this shape:
 {
   "institution": "string",
@@ -30,10 +33,10 @@ Return ONLY one JSON object, no prose, with this shape:
   "grand_total": number or null (the overall total the document shows, if any; some accounts may be outside it),
   "accounts": [
     {"account": "account name as shown, e.g. CMA-Edge or Roth IRA (NEVER a full account number)",
-     "account_suffix": "last 4 characters of the account number as shown (e.g. 4567 for 12A-34567 or ...4567), else null",
+     "account_suffix": "last 4 characters of THIS account's number as shown next to it or on its details page (e.g. 4567 for 12A-34567 or ...4567). Never copy another account's number; two accounts never share one. null if none is shown",
      "statement_total": number or null (this account's total value as shown),
      "closed": true if the document marks the account as closed, else false,
-     "category": "the section or category heading the account is listed under, e.g. Banking, Investments, Loans, Credit cards; null if none",
+     "category": "the TOP-LEVEL section the account is listed under, e.g. Banking, Investments, Loans, Credit cards; never a sub-group inside that section, and without any count shown next to the heading; null if none",
      "held_at": "the institution the document shows for this account if it names one (e.g. Merrill on a Bank of America page), else null",
      "holdings": [
        {"symbol": "ticker or null", "description": "string",

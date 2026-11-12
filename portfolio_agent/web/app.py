@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from .. import config, registry, series, store
 from ..ingest_graph import approve_held
-from ..runner import run_logins
+from ..runner import run_logins, select_logins
 from ..timeutil import now, parse_iso
 
 STATIC = Path(__file__).parent / "static"
@@ -37,8 +37,15 @@ class AnswerIn(BaseModel):
     answer: str
 
 
+class OwnerNameIn(BaseModel):
+    name: str
+
+
 class KillIn(BaseModel):
     on: bool
+
+
+_START_LOCK = threading.Lock()
 
 
 def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
@@ -52,6 +59,14 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
         return load_chat_model()
 
     loader = model_loader or _default_loader
+
+    # Login rules also cover accounts found before a rule was added or changed.
+    c0 = store.connect(db_path)
+    try:
+        for lg in registry.list_logins(c0):
+            registry.apply_login_rules(c0, lg)
+    finally:
+        c0.close()
 
     @app.middleware("http")
     async def require_client_header(request: Request, call_next):
@@ -75,25 +90,34 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
         accts = {a["id"]: a for a in registry.list_accounts(c)}
         active = [p for p in store.current_positions(c)
                   if accts.get(p["account_id"], {}).get("status") == "active"]
-        return {"net_worth": sum(p["total"] for p in active),
+        return {"net_worth": sum(p["total"] for p in active),            # your share
+                "net_worth_full": sum(p["full_total"] for p in active),  # whole accounts
+                "has_part_owned": any(p["share_pct"] for p in active),
                 "latest_retrieval": max((p["retrieved_at"] for p in active), default=None),
                 "last_nightly": store.last_run(c, "nightly"),
                 "last_refresh": store.last_run(c, "refresh"),
                 "running": store.running_runs(c),
+                # Per-login Refresh buttons: these logins are being refreshed (or share an
+                # institution with one that is). Dashboard Refresh: is any due login free?
+                "busy_login_ids": sorted(busy := store.busy_login_ids(c)),
+                "refresh_all_available": any(lg["id"] not in busy
+                                             for lg in select_logins(c, "refresh")),
                 "inbox_open": len(store.open_review_items(c, registered_only=True)),
                 "kill_switch": config.KILL_FILE.exists()}
 
     @app.get("/api/series")
     def get_series(start: date | None = None, end: date | None = None,
                    granularity: str = "daily", group: str = "account",
-                   known_on: date | None = None, c=Depends(conn)):
+                   known_on: date | None = None, basis: str = "share", c=Depends(conn)):
+        if basis not in ("share", "full"):
+            raise HTTPException(400, "basis must be share or full")
         if granularity not in ("daily", "monthly") or group not in ("account", "institution", "type"):
             raise HTTPException(400, "bad granularity or group")
         ko = None
         if known_on:
             from ..timeutil import end_of_local_day, to_iso
             ko = to_iso(end_of_local_day(known_on))
-        return series.build_series(c, start, end, granularity, group, ko)
+        return series.build_series(c, start, end, granularity, group, ko, full=basis == "full")
 
     @app.get("/api/positions")
     def positions(c=Depends(conn)):
@@ -105,13 +129,15 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
                 continue
             p["status"] = series.account_status(c, a)
             p["account"], p["login_name"] = a["display_name"], a["login_name"]
+            p["owner_name"] = a["owner_name"]
             out.append(p)
         seen = {p["account_id"] for p in out}
         for a in accts.values():   # registered accounts with no stored value yet
             if a["id"] not in seen and a["status"] != "closed":
                 out.append({"account_id": a["id"], "account": a["display_name"],
                             "login_name": a["login_name"], "institution": a["institution"],
-                            "total": None, "holdings": [], "snapshot_id": None,
+                            "total": None, "full_total": None, "share_pct": None,
+                            "holdings": [], "snapshot_id": None,
                             "status": series.account_status(c, a)})
         return out
 
@@ -236,6 +262,43 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
         except ValueError as e:
             raise HTTPException(400, str(e))
 
+    # --- owners (part-owned entities such as an LLC) ---------------------------
+
+    @app.get("/api/owners")
+    def owners(c=Depends(conn)):
+        return registry.list_owners(c)
+
+    @app.post("/api/owners")
+    def add_owner(body: registry.OwnerIn, c=Depends(conn)):
+        try:
+            return registry.create_owner(c, body)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.put("/api/owners/{oid}")
+    def edit_owner(oid: int, body: OwnerNameIn, c=Depends(conn)):
+        if not registry.get_owner(c, oid):
+            raise HTTPException(404)
+        try:
+            return registry.rename_owner(c, oid, body.name)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/api/owners/{oid}/shares")
+    def add_owner_share(oid: int, body: registry.OwnerShareIn, c=Depends(conn)):
+        try:
+            return registry.add_owner_share(c, oid, body)
+        except ValueError as e:
+            raise HTTPException(404, str(e))
+
+    @app.delete("/api/owners/{oid}")
+    def delete_owner(oid: int, c=Depends(conn)):
+        try:
+            registry.delete_owner(c, oid)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {"ok": True}
+
     # --- runs ------------------------------------------------------------------
 
     @app.post("/api/refresh")
@@ -254,12 +317,27 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
         return start_refresh(c, [lid])
 
     def start_refresh(c, login_ids: list[int] | None) -> dict:
+        """Refreshes run in parallel, one per institution at a time (logins at one
+        institution share a browser profile), up to MAX_PARALLEL_RUNS at once."""
         _expire_stuck_runs(c)
-        if store.running_runs(c):
-            raise HTTPException(409, "A run is already in progress.")
         if config.KILL_FILE.exists():
             raise HTTPException(409, "The kill switch is on.")
-        run_id = store.start_run(c, "refresh")
+        with _START_LOCK:   # two clicks at once must not both pass the busy check
+            if len(store.running_runs(c)) >= config.MAX_PARALLEL_RUNS:
+                raise HTTPException(409, f"{config.MAX_PARALLEL_RUNS} refreshes are already "
+                                    "running; try again when one finishes.")
+            busy = store.busy_login_ids(c)
+            if login_ids is not None:
+                if set(login_ids) & busy:
+                    raise HTTPException(409, "This login, or another at the same institution, "
+                                        "is already being refreshed.")
+            else:   # dashboard Refresh: every due login not already being refreshed
+                due = [lg["id"] for lg in select_logins(c, "refresh")]
+                login_ids = [i for i in due if i not in busy]
+                if due and not login_ids:
+                    raise HTTPException(409, "Every login is already being refreshed.")
+            run_id = store.start_run(c, "refresh")
+            store.set_run_logins(c, run_id, login_ids)
 
         def work():
             wc = store.connect(db_path)

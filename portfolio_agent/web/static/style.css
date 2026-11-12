@@ -78,3 +78,19 @@ dialog::backdrop { background: rgba(0,0,0,.4); }
 .thumb { display: inline-flex; flex-direction: column; gap: 4px; font-size: 12px; }
 .thumb img { width: 220px; max-height: 160px; object-fit: cover; object-position: top; border: 1px solid var(--line); border-radius: 6px; }
 td.wrap { word-break: break-word; font-size: 12px; }
+.table-scroll { overflow-x: auto; }
+th { position: relative; }
+.col-grip { position: absolute; top: 0; right: -4px; width: 8px; height: 100%; cursor: col-resize; z-index: 1; touch-action: none; }
+.col-grip:hover, .col-grip.on { background: var(--accent); opacity: .35; }
+table.fixed { table-layout: fixed; }
+table.fixed td { overflow: hidden; word-break: break-word; }
+table.fixed td.clip { white-space: nowrap; text-overflow: ellipsis; }
+#login-accounts tr.dirty td { background: var(--pill-warn); }
+#positions tr.filters th { padding: 4px 8px 8px; }
+#positions tr.filters input, #positions tr.filters select { width: 100%; min-width: 0; font-size: 12px; padding: 3px 6px; }
+#positions tr.filters input.bad { border-color: var(--bad); }
+#positions tfoot td { border-bottom: none; font-weight: 600; }
+[hidden] { display: none !important; }
+.controls .basis { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+td .sub { color: var(--muted); font-size: 12px; }
+#owner-list .share-form { margin: 8px 0 0; }

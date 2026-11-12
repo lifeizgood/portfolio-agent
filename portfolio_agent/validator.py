@@ -89,6 +89,15 @@ def validate_extraction(ext: Extraction) -> list[str]:
     keys = [a.key for a in ext.accounts]
     if len(keys) != len(set(keys)):
         errors.append("The same account was extracted twice; list each account once.")
+    by_suffix: dict[str, list[str]] = {}
+    for a in ext.accounts:
+        if a.account_suffix:
+            by_suffix.setdefault(a.account_suffix, []).append(a.account)
+    for suffix, names in by_suffix.items():
+        if len(set(names)) > 1:
+            errors.append(f"{' and '.join(repr(n) for n in names)} were all given the account "
+                          f"number ending {suffix}. Give each account only the number shown "
+                          "next to it (or on its details page), else null.")
     # The page's overall total must be covered. Accounts may add up to MORE than it:
     # portals leave some accounts out of the overall value, and those are still kept.
     if ext.grand_total and ext.accounts:
