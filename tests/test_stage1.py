@@ -3,11 +3,13 @@ browser guardrails, navigator, runner and the dashboard API. No model download,
 no real browser. All data here is fictional test data.
 """
 
+import io
 import json
 import stat
 import threading
 import time
 from datetime import date
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -966,3 +968,325 @@ def test_number_link_saved_in_playbook(conn):
     lid = bofa_login(conn, account_number_link="Account & Routing Numbers")
     assert registry.get_login(conn, lid)["account_number_link"] == "Account & Routing Numbers"
     assert registry.steps_for(conn, "Bank of America")["account_number_link"] == "Account & Routing Numbers"
+
+
+# --- cancelling a refresh ----------------------------------------------------
+
+def test_cancel_during_fetch_stores_nothing_and_skips_remaining_logins(conn, tmp_path):
+    add_login(conn)
+    add_login(conn, name="Other", institution="Other Bank",
+              login_url="https://www.other.com", allowed_domains="other.com")
+    inner = fake_fetcher(tmp_path)
+    calls = []
+
+    def fetch(login, creds, ctx):
+        calls.append(login["name"])
+        store.request_cancel(conn, ctx_run[0])        # user presses Cancel mid-fetch
+        return inner(login, creds, ctx)
+
+    ctx_run = [store.start_run(conn, "refresh")]
+    model = FakeListChatModel(responses=[json.dumps(PAGE)])
+    run_logins(conn, "refresh", lambda: model, fetcher=fetch, run_id=ctx_run[0])
+    r = store.get_run(conn, ctx_run[0], detail=True)
+    assert r["status"] == "cancelled" and "1 not started" in r["summary"]
+    assert len(calls) == 1                                        # second login never began
+    assert [i["outcome"] for i in r["items"]] == ["cancelled"]
+    assert store.current_positions(conn) == []                    # captured but not read
+    assert not [i for i in store.open_review_items(conn) if i["kind"] in ("question", "alert")]
+
+
+def test_cancel_stops_waiting_for_a_code(conn):
+    from portfolio_agent.runner import _ask_for_code
+    lid = add_login(conn)
+    with pytest.raises(FetchStopped) as e:
+        _ask_for_code(conn, registry.get_login(conn, lid), "need code", lambda: True)
+    assert e.value.kind == "cancelled"
+    assert not [i for i in store.open_review_items(conn) if i["kind"] == "twofa_code"]
+
+
+def test_cancel_api(client):
+    c = store.connect(client.db)
+    rid = store.start_run(c, "refresh")
+    store.set_run_logins(c, rid, [], "dashboard")
+    run = client.get("/api/summary").json()["running"][0]
+    assert run["trigger"] == "dashboard" and not run["cancel_requested"]
+    assert client.post(f"/api/runs/{rid}/cancel", headers=H).status_code == 200
+    assert client.get("/api/summary").json()["running"][0]["cancel_requested"]
+    store.finish_run(c, rid, "cancelled", "Cancelled by you.")
+    assert client.post(f"/api/runs/{rid}/cancel", headers=H).status_code == 409
+    assert client.post("/api/runs/9999/cancel", headers=H).status_code == 404
+
+
+# --- login form inside an iframe (Schwab) -------------------------------------
+
+def test_login_form_inside_allowed_iframe_is_found():
+    pw_api = pytest.importorskip("playwright.sync_api")
+    from portfolio_agent.browser.portal import _classify, _frames, _login_scope
+    pages = {
+        "https://client.example.com/login": "<h1>Welcome</h1>"
+            "<iframe src='https://gateway.example.com/form' width=400 height=200></iframe>"
+            "<iframe src='https://ads.other.com/x' width=400 height=200></iframe>",
+        "https://gateway.example.com/form": "<form><input id='loginIdInput'>"
+            "<input type='password' id='passwordInput'><button type='submit'>Log in</button></form>",
+        "https://ads.other.com/x": "<form><input type='password' id='evil'></form>",
+    }
+    try:
+        with pw_api.sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.route("**/*", lambda r: r.fulfill(body=pages.get(r.request.url.split("?")[0], ""),
+                                                   content_type="text/html"))
+            page.goto("https://client.example.com/login")
+            page.wait_for_load_state("load")
+            domains = ["example.com"]
+            assert _classify(page) == "ok"                     # old behaviour: looked signed in
+            assert _classify(page, domains) == "login"
+            assert len(_frames(page, domains)) == 2            # other.com's frame left out
+            scope = _login_scope(page, domains, {})
+            assert scope.url.startswith("https://gateway.example.com")
+            scope.locator("input[type=password]").first.fill("x")
+            assert _login_scope(page, ["other.com"], {}).locator("#evil").count() == 1
+            browser.close()
+    except pw_api.Error as e:
+        if "Executable doesn't exist" in str(e):
+            pytest.skip("Playwright browser not installed")
+        raise
+
+
+
+# --- uploaded statements ---------------------------------------------------------
+
+def make_pdf(lines: list[str]) -> bytes:
+    """A one-page PDF with these lines of text (fictional content)."""
+    esc = lambda t: t.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    body = "BT /F1 11 Tf 50 750 Td 14 TL " + " ".join(f"({esc(l)}) Tj T*" for l in lines) + " ET"
+    objs = ["<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R"
+            " /Resources << /Font << /F1 5 0 R >> >> >>",
+            f"<< /Length {len(body)} >>\nstream\n{body}\nendstream",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    out, offsets = b"%PDF-1.4\n", []
+    for i, o in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n{o}\nendobj\n".encode()
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    out += "".join(f"{o:010d} 00000 n \n" for o in offsets).encode()
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return out
+
+
+STATEMENT_PDF = make_pdf(["Example Wealth Partners", "Statement period October 1 - October 31, 2026",
+                          "Alex Trust ...1234  Ending value 12,000.00",
+                          "Kid - 529 ...5678  Ending value 3,000.00"])
+STATEMENT = {
+    "institution": "Example Wealth", "as_of": "2026-10-31", "grand_total": 15000.0,
+    "accounts": [
+        {"account": "Alex Trust", "account_suffix": "1234", "statement_total": 12000.0,
+         "holdings": [{"symbol": "VTI", "description": "Vanguard Total Stock Market",
+                       "quantity": 40, "price": 250.0, "value": 10000.0},
+                      {"symbol": None, "description": "Cash", "value": 2000.0}]},
+        {"account": "Kid - 529", "account_suffix": "5678", "statement_total": 3000.0,
+         "holdings": [{"symbol": None, "description": "Age-based portfolio", "value": 3000.0}]}]}
+
+
+def upload_login(conn) -> int:
+    return add_login(conn, name="Example Wealth", institution="Example Wealth",
+                     access_method="upload", cadence="monthly", login_url=None,
+                     allowed_domains=None)
+
+
+def upload_client(tmp_path, responses):
+    db = tmp_path / "u.db"
+    model = FakeListChatModel(responses=responses)
+    c = TestClient(create_app(str(db), model_loader=lambda: model, run_in_thread=False))
+    c.db = db
+    return c
+
+
+def post_pdf(c, lid, data, name="Oct 2026 statement.pdf"):
+    from urllib.parse import quote
+    return c.post(f"/api/logins/{lid}/statements", content=data,
+                  headers={"X-PA-Client": "1", "Content-Type": "application/pdf",
+                           "X-Filename": quote(name)})
+
+
+def test_upload_login_needs_no_url_and_is_never_fetched(conn):
+    from portfolio_agent.runner import select_logins
+    lid = upload_login(conn)
+    lg = registry.get_login(conn, lid)
+    assert lg["access_method"] == "upload" and lg["cadence"] == "monthly"
+    assert lid not in [x["id"] for x in select_logins(conn, "nightly")]
+    assert lid not in [x["id"] for x in select_logins(conn, "refresh")]
+
+
+def test_save_upload_checks_the_file_and_keeps_it_private(conn, tmp_path, monkeypatch):
+    from portfolio_agent.statements import UploadError, save_upload
+    monkeypatch.setattr(config, "STATEMENTS_DIR", tmp_path / "statements")
+    lg = registry.get_login(conn, upload_login(conn))
+    with pytest.raises(UploadError):
+        save_upload(conn, lg, "notes.pdf", b"hello")
+    with pytest.raises(UploadError):
+        save_upload(conn, lg, "empty.pdf", b"")
+    up = save_upload(conn, lg, "../../Oct statement.pdf", STATEMENT_PDF)
+    p = Path(up["path"])
+    assert up["duplicate"] is False and p.parent == tmp_path / "statements" / f"login-{lg['id']}"
+    assert ".." not in p.name and stat.S_IMODE(p.stat().st_mode) == 0o600
+    again = save_upload(conn, lg, "copy.pdf", STATEMENT_PDF)
+    assert again["duplicate"] is True and again["id"] == up["id"]
+    assert len(list(p.parent.iterdir())) == 1
+
+
+def test_uploaded_consolidated_statement_finds_every_account(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "STATEMENTS_DIR", tmp_path / "statements")
+    c = upload_client(tmp_path, [json.dumps(STATEMENT)])
+    lid = c.post("/api/logins", headers=H, json={
+        "name": "Example Wealth", "institution": "Example Wealth",
+        "access_method": "upload", "cadence": "monthly"}).json()["id"]
+    up = post_pdf(c, lid, STATEMENT_PDF).json()
+    assert up["duplicate"] is False and "path" not in up
+    run_id = c.post(f"/api/logins/{lid}/statements/read", headers=H,
+                    json={"upload_ids": [up["id"]]}).json()["run_id"]
+    run = c.get(f"/api/runs/{run_id}").json()
+    assert run["kind"] == "upload" and run["status"] == "done"
+    assert "Alex Trust" in run["items"][0]["detail"] and "Kid - 529" in run["items"][0]["detail"]
+    # Both accounts are new: each waits in the Inbox, dated at the period's close.
+    inbox = c.get("/api/inbox").json()
+    held = [i for i in inbox if i["kind"] == "held_value"]
+    assert len(held) == 2
+    assert all(i["payload"]["snapshot"]["as_of_datetime"].startswith("2026-10-31") for i in held)
+    assert all(i["payload"]["snapshot"]["source"] == "statement" for i in held)
+    assert all(i["evidence_files"] == [Path(store.get_upload(store.connect(c.db), up["id"])["path"]).name]
+               for i in held)
+    for i in held:
+        c.post(f"/api/inbox/{i['id']}/approve", headers=H)
+    totals = {p["account"]: p["total"] for p in c.get("/api/positions").json()}
+    assert sorted(totals.values()) == [3000.0, 12000.0]
+    ups = c.get(f"/api/logins/{lid}/statements").json()
+    assert ups[0]["outcome"] == "held" and ups[0]["filename"] == "Oct 2026 statement.pdf"
+    assert c.get(f"/api/statements/{up['id']}/file").content == STATEMENT_PDF
+    # The same file again is recognized, not saved twice.
+    assert post_pdf(c, lid, STATEMENT_PDF).json()["duplicate"] is True
+
+
+def test_statement_prompt_and_missing_date(tmp_path, monkeypatch):
+    from portfolio_agent.extractor import STATEMENT_NOTE, build_prompt
+    assert STATEMENT_NOTE in build_prompt("x", statement=True)[1].content
+    assert STATEMENT_NOTE not in build_prompt("x")[1].content
+    monkeypatch.setattr(config, "STATEMENTS_DIR", tmp_path / "statements")
+    undated = json.dumps({**STATEMENT, "as_of": None})
+    c = upload_client(tmp_path, [undated, undated])
+    lid = c.post("/api/logins", headers=H, json={
+        "name": "Example Wealth", "institution": "Example Wealth",
+        "access_method": "upload"}).json()["id"]
+    up = post_pdf(c, lid, STATEMENT_PDF).json()
+    run_id = c.post(f"/api/logins/{lid}/statements/read", headers=H,
+                    json={"upload_ids": [up["id"]]}).json()["run_id"]
+    item = c.get(f"/api/runs/{run_id}").json()["items"][0]
+    assert item["outcome"] == "review" and "No statement date" in item["detail"]
+    assert c.get("/api/positions").json() == []      # never dated by the upload time
+
+
+def test_locked_or_foreign_statements_are_refused(tmp_path, monkeypatch):
+    from pypdf import PdfReader, PdfWriter
+    monkeypatch.setattr(config, "STATEMENTS_DIR", tmp_path / "statements")
+    c = upload_client(tmp_path, [])
+    lid = c.post("/api/logins", headers=H, json={
+        "name": "Example Wealth", "institution": "Example Wealth",
+        "access_method": "upload"}).json()["id"]
+    assert post_pdf(c, lid, b"PK\x03\x04zip").status_code == 400
+    w = PdfWriter()
+    for pg in PdfReader(io.BytesIO(STATEMENT_PDF)).pages:
+        w.add_page(pg)
+    w.encrypt("secret-test-pw", algorithm="RC4-128")
+    buf = io.BytesIO(); w.write(buf)
+    up = post_pdf(c, lid, buf.getvalue(), "locked.pdf").json()
+    run_id = c.post(f"/api/logins/{lid}/statements/read", headers=H,
+                    json={"upload_ids": [up["id"]]}).json()["run_id"]
+    item = c.get(f"/api/runs/{run_id}").json()["items"][0]
+    assert item["outcome"] == "stopped" and "password-protected" in item["detail"]
+    # Another login's upload can't be read through this one.
+    other = c.post("/api/logins", headers=H, json={
+        "name": "Other", "institution": "Other", "access_method": "upload"}).json()["id"]
+    assert c.post(f"/api/logins/{other}/statements/read", headers=H,
+                  json={"upload_ids": [up["id"]]}).status_code == 400
+
+
+# --- statement guides (layouts only; fictional sample text) ------------------------
+
+FAKE_RCM = """STATEMENT FOR THE PERIOD OCTOBER 1, 2026 TO OCTOBER 31, 2026
+ALEX SAMPLE - Individual TOD
+Account Number: AAA-001234
+Holdings
+CASH AND CASH EQUIVALENTS - 5.00% of Total Account Value
+BANK DEPOSIT SWEEP PROGRAM
+500.00 $1.00 $500.00
+Total Cash and Cash Equivalents  $500.00
+HOLDINGS > OPTIONS - -1.00% of Total Account Value
+CALL (ABC) EXAMPLE CORP JAN 16 27 $50 (100 SHS) CASH
+ABC260116C50
+(1) $1.00 ($100.00) $300.00    $200.00
+TOTAL PORTFOLIO VALUE $10,000.00 $1.00 $9,000.00 $100.00
+Activity
+11/02/26 BOUGHT EXAMPLE CORP 10 $50.00
+Footnotes and Cost Basis Information
+Long legal text."""
+
+
+def test_statement_guides_pick_layout_and_cut_activity():
+    from portfolio_agent.statement_guides import guide_for, trim
+    assert guide_for("Rockefeller Digital").keywords[0] == "rockefeller"
+    assert guide_for("RCM").keywords[0] == "rockefeller"
+    assert guide_for("Charles Schwab").keywords[0] == "schwab"
+    assert guide_for("Bank of America") is None and guide_for(None) is None
+    rcm = guide_for("Rockefeller Digital")
+    cut = trim(FAKE_RCM, rcm)
+    assert "TOTAL PORTFOLIO VALUE $10,000.00" in cut and "BOUGHT" not in cut and "legal" not in cut
+    empty = FAKE_RCM.split("Holdings")[0] + ("Holdings\nThere were no positions in your account."
+                                            "\nFootnotes and Cost Basis Information\nLegal.")
+    assert trim(empty, rcm).endswith("left out ...]") and "Legal" not in trim(empty, rcm)
+    schwab = "Positions - Equities\nABC EXAMPLE 1 2 2\nTransactions - Summary\nBought ABC"
+    assert "Bought" not in trim(schwab, guide_for("Charles Schwab"))
+    assert trim("no markers here", rcm) == "no markers here"
+    assert trim(FAKE_RCM, None) == FAKE_RCM
+
+
+def test_validator_allows_written_options_and_margin_cash_when_total_checks():
+    from portfolio_agent.validator import validate
+    holdings = [{"description": "Cash", "value": 500.0},
+                {"symbol": "XYZ", "description": "Example Corp", "quantity": 100, "price": 96.0,
+                 "value": 9600.0},
+                {"symbol": "ABC260116C50", "description": "CALL EXAMPLE JAN 27 50",
+                 "quantity": -1, "price": 1.0, "value": -100.0}]
+    ok = validate(snap(holdings=holdings, statement_total=10000.0), today=date(2026, 11, 12))
+    assert ok.ok, ok.errors
+    # Without a stated total a negative holding is still an error (likely a misread sign).
+    assert not validate(snap(holdings=holdings, statement_total=None),
+                        today=date(2026, 11, 12)).ok
+    # A wrong option value is still caught (neither x1 nor x100 matches).
+    bad = holdings[:2] + [{**holdings[2], "value": -37.0}]
+    assert not validate(snap(holdings=bad, statement_total=10063.0), today=date(2026, 11, 12)).ok
+
+
+def test_statement_reading_uses_the_institution_guide(tmp_path, monkeypatch):
+    from portfolio_agent.statement_guides import ROCKEFELLER
+    from portfolio_agent.statements import read_uploads, save_upload
+    monkeypatch.setattr(config, "STATEMENTS_DIR", tmp_path / "statements")
+    seen = []
+
+    class Recorder:
+        def invoke(self, messages):
+            seen.append(messages[1].content)
+            return FakeListChatModel(responses=[json.dumps(STATEMENT)]).invoke(messages)
+
+    c = store.connect(":memory:")
+    lid = add_login(c, name="RCM", institution="Rockefeller Digital", access_method="upload",
+                    login_url=None, allowed_domains=None)
+    lg = registry.get_login(c, lid)
+    up = save_upload(c, lg, "s.pdf", STATEMENT_PDF)
+    run = store.start_run(c, "upload")
+    read_uploads(c, run, lg, [up["id"]], lambda: Recorder())
+    assert ROCKEFELLER.notes in seen[0]
+    steps = json.loads(c.execute("SELECT trace FROM run_items").fetchone()[0])
+    assert steps[1]["guide"] == "rockefeller" and steps[1]["read"] <= steps[1]["chars"] + 80

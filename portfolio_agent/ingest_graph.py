@@ -128,13 +128,24 @@ def build_ingest_graph(model, conn, today=None):
         login = state.get("login")
         inst = login["institution"] if login else state.get("institution")
         playbook = store.get_playbook(conn, inst) if inst else None
+        if state.get("source") == "statement":      # the institution's statement layout
+            from .statement_guides import guide_for
+            guide = guide_for(inst)
+            if guide:
+                playbook = "\n\n".join(x for x in (guide.notes, playbook) if x)
         attempts = state["attempts"] + 1
         try:
             ext = extract(model, state["text"], playbook, state.get("errors") or None,
-                          captured_at=state["retrieved_at"] if state.get("source") == "portal" else None)
+                          captured_at=state["retrieved_at"] if state.get("source") == "portal" else None,
+                          statement=state.get("source") == "statement")
         except ExtractionError as e:
             return {"extraction": None, "errors": [str(e)], "attempts": attempts}
         ext = apply_detail_numbers(ext, state.get("details") or [])
+        if ext.as_of_datetime is None and state.get("source") == "statement":
+            # A statement is dated by its period; the upload time would misdate it.
+            return {"extraction": None, "attempts": attempts, "errors": [
+                "No statement date was found. Give as_of as the closing date of the "
+                "statement period."]}
         if ext.as_of_datetime is None:   # no date shown: use the capture time (spec D16)
             ext = ext.model_copy(update={"as_of_datetime": parse_iso(state["retrieved_at"])})
         return {"extraction": ext.model_dump(mode="json"), "attempts": attempts}

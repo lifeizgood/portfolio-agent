@@ -122,14 +122,14 @@
         <label>Name<input name="name" required placeholder="Merrill Lynch"></label>
         <label>Institution<input name="institution" required placeholder="Merrill Lynch"></label>
         <label>Access method<select name="access_method">
-          <option value="browser">Browser</option><option value="api">API</option>
+          <option value="browser">Browser</option><option value="upload">Upload statements</option><option value="api">API</option>
           <option value="email_statement">Email statement</option><option value="manual">Manual</option></select></label>
         <label>Login page URL<input name="login_url" type="url" placeholder="https://www.mymerrill.com"></label>
         <label>Allowed domains<input name="allowed_domains" placeholder="defaults to the login page's domain"></label>
         <label>2FA method<select name="twofa_method">
           <option value="remembered_device">Remembered device</option><option value="sms">SMS</option>
           <option value="email">Email</option><option value="authenticator">Authenticator app</option></select></label>
-        <label>Cadence<select name="cadence"><option value="nightly">Nightly</option><option value="quarterly">Quarterly</option></select></label>
+        <label>Cadence<select name="cadence"><option value="nightly">Nightly</option><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option></select></label>
         <label class="check"><input type="checkbox" name="holds_public" checked> Holds public securities (included in Refresh)</label>
         <label>Status<select name="status"><option value="active">Active</option><option value="closed">Closed</option></select></label>
         <label>Closed on<input name="closed_on" type="date"></label>
@@ -155,6 +155,12 @@
       <div class="row"><button type="submit" class="primary">Save login</button>
         <button type="button" id="cancel-login">Cancel</button><span id="login-msg" class="msg"></span></div>
     </form>
+
+    <div id="statements-section" hidden>
+      <h3>Statements uploaded</h3>
+      <p class="muted">Upload each month's statements with <b>Upload statements</b> on this login's row: one per account, or one consolidated statement for all of them. Each account found is stored at the statement's closing date; a new account waits in the Inbox to be included or excluded. The files stay on this Mac.</p>
+      <table id="statement-list"><thead><tr><th>File</th><th>Uploaded</th><th>Result</th><th></th></tr></thead><tbody></tbody></table>
+    </div>
 
     <div id="cred-section" hidden>
       <h3>Username and password</h3>

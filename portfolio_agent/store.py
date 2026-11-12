@@ -126,6 +126,18 @@ CREATE TABLE IF NOT EXISTS owner_shares (      -- your percentage, from a date; 
     effective_from TEXT NOT NULL,              -- local date
     recorded_at    TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS statement_uploads (  -- statement files the user uploaded
+    id           INTEGER PRIMARY KEY,
+    login_id     INTEGER NOT NULL REFERENCES logins(id),
+    filename     TEXT NOT NULL,              -- name as uploaded
+    path         TEXT NOT NULL,              -- saved copy under data/private/statements
+    sha256       TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    uploaded_at  TEXT NOT NULL,
+    run_id       INTEGER,                    -- the run that last read it
+    outcome      TEXT,                       -- stored | held | mixed | review | stopped | error
+    detail       TEXT
+);
 CREATE TABLE IF NOT EXISTS login_attempts (
     id           INTEGER PRIMARY KEY,
     account_id   INTEGER NOT NULL,
@@ -151,7 +163,9 @@ _MIGRATIONS = {
                "open_account_details": "INTEGER NOT NULL DEFAULT 0"},
     "run_items": {"login_id": "INTEGER", "evidence": "TEXT"},
     "login_attempts": {"login_id": "INTEGER"},
-    "runs": {"pid": "INTEGER", "login_ids": "TEXT"},   # logins the run covers (JSON list)
+    "runs": {"pid": "INTEGER", "login_ids": "TEXT",     # logins the run covers (JSON list)
+             "trigger": "TEXT",                         # dashboard | login | nightly
+             "cancel_requested": "INTEGER NOT NULL DEFAULT 0"},
     "holdings": {"price_as_of": "TEXT"},   # a holding's own as-of date, when it has one       # process doing the run, to spot orphaned runs
 }
 
@@ -558,6 +572,38 @@ def save_steps(conn, institution: str, steps: dict) -> None:
     conn.commit()
 
 
+# --- uploaded statements -----------------------------------------------------
+
+def add_upload(conn, login_id: int, filename: str, path: str, sha256: str, size: int) -> int:
+    cur = conn.execute("INSERT INTO statement_uploads (login_id, filename, path, sha256, size,"
+                       " uploaded_at) VALUES (?,?,?,?,?,?)",
+                       (login_id, filename, path, sha256, size, now_iso()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_upload(conn, upload_id: int) -> dict | None:
+    r = conn.execute("SELECT * FROM statement_uploads WHERE id=?", (upload_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def find_upload(conn, login_id: int, sha256: str) -> dict | None:
+    r = conn.execute("SELECT * FROM statement_uploads WHERE login_id=? AND sha256=?"
+                     " ORDER BY id LIMIT 1", (login_id, sha256)).fetchone()
+    return dict(r) if r else None
+
+
+def list_uploads(conn, login_id: int) -> list[dict]:
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM statement_uploads WHERE login_id=? ORDER BY id DESC", (login_id,))]
+
+
+def set_upload_result(conn, upload_id: int, run_id: int, outcome: str, detail: str) -> None:
+    conn.execute("UPDATE statement_uploads SET run_id=?, outcome=?, detail=? WHERE id=?",
+                 (run_id, outcome, detail, upload_id))
+    conn.commit()
+
+
 # --- runs and login attempts -------------------------------------------------
 
 def start_run(conn, kind: str) -> int:
@@ -644,9 +690,25 @@ def last_run(conn, kind: str | None = None) -> dict | None:
     return get_run(conn, r["id"]) if r else None
 
 
-def set_run_logins(conn, run_id: int, login_ids: list[int]) -> None:
-    conn.execute("UPDATE runs SET login_ids=? WHERE id=?", (json.dumps(login_ids), run_id))
+def set_run_logins(conn, run_id: int, login_ids: list[int], trigger: str | None = None) -> None:
+    conn.execute("UPDATE runs SET login_ids=?, trigger=COALESCE(?, trigger) WHERE id=?",
+                 (json.dumps(login_ids), trigger, run_id))
     conn.commit()
+
+
+def request_cancel(conn, run_id: int) -> bool:
+    """Ask a running run to stop. It stops at its next check: between pages, while
+    waiting for a code, or before reading a captured page. Reading already under way
+    (the model) finishes first. False if the run isn't running."""
+    cur = conn.execute("UPDATE runs SET cancel_requested=1 WHERE id=? AND status='running'",
+                       (run_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def cancel_requested(conn, run_id: int) -> bool:
+    r = conn.execute("SELECT cancel_requested FROM runs WHERE id=?", (run_id,)).fetchone()
+    return bool(r and r[0])
 
 
 def busy_login_ids(conn) -> set[int]:

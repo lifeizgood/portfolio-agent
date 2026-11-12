@@ -75,6 +75,7 @@ class FetchContext:
     request_code: Callable[[str], str | None]       # asks the user via the inbox
     model_loader: Callable[[], object]              # LLM, loaded only if needed
     trace: Trace = field(default_factory=Trace)
+    should_cancel: Callable[[], bool] = lambda: False   # the user pressed Cancel
 
 
 class _PageAdapter:
@@ -117,10 +118,11 @@ class _PageAdapter:
 class _Holder:
     """Current page plus the allowlist state shared with the route handler."""
 
-    def __init__(self, page, deadline):
+    def __init__(self, page, deadline, should_cancel=lambda: False):
         self.page = page
         self.blocked_nav: str | None = None
         self.deadline = deadline
+        self.should_cancel = should_cancel
 
     def check(self):
         if self.blocked_nav:
@@ -128,6 +130,8 @@ class _Holder:
                                f"{self.blocked_nav}, outside the allowed domains. Stopped.")
         if config.KILL_FILE.exists():
             raise FetchStopped("kill", "Kill switch is on.")
+        if self.should_cancel():
+            raise FetchStopped("cancelled", "Cancelled by you.")
         if time.monotonic() > self.deadline:
             raise FetchStopped("timeout", f"The fetch took longer than {config.FETCH_TIMEOUT_S}s.")
 
@@ -158,13 +162,15 @@ def fetch_portal(login: dict, creds: dict | None, ctx: FetchContext) -> Evidence
 
     if config.KILL_FILE.exists():
         raise FetchStopped("kill", "Kill switch is on.")
+    if ctx.should_cancel():
+        raise FetchStopped("cancelled", "Cancelled by you.")
     if not login.get("login_url"):
         raise FetchStopped("config", "No login page URL in Settings for this login.")
     domains = registry.domains(login)
     steps = registry.steps_for(ctx.conn, login["institution"])
+    trace = ctx.trace
     profile = config.BROWSER_PROFILES_DIR / _slug(login["institution"])
     profile.mkdir(parents=True, exist_ok=True)
-    trace = ctx.trace
 
     with sync_playwright() as p:
         browser = p.chromium.launch_persistent_context(
@@ -173,7 +179,7 @@ def fetch_portal(login: dict, creds: dict | None, ctx: FetchContext) -> Evidence
         holder = None
         try:
             holder = _Holder(browser.pages[0] if browser.pages else browser.new_page(),
-                             time.monotonic() + config.FETCH_TIMEOUT_S)
+                             time.monotonic() + config.FETCH_TIMEOUT_S, ctx.should_cancel)
 
             def guard_route(route, request):
                 if (request.is_navigation_request() and request.frame.parent_frame is None
@@ -207,11 +213,11 @@ def fetch_portal(login: dict, creds: dict | None, ctx: FetchContext) -> Evidence
             for n, url in enumerate(saved, 1):
                 trace.add("goto_saved_holdings_url", url=url)
                 _PageAdapter(holder).goto(url)
-                state = _classify(holder.page)
+                state = _classify(holder.page, domains)
                 if state == "login":   # session expired between pages: log in once more
                     _login(holder, login, creds, steps, ctx)
                     _PageAdapter(holder).goto(url)
-                    state = _classify(holder.page)
+                    state = _classify(holder.page, domains)
                 if state != "ok":
                     trace.add("saved_route_failed", url=url, state=state)
                     pages = []
@@ -247,9 +253,35 @@ def fetch_portal(login: dict, creds: dict | None, ctx: FetchContext) -> Evidence
             browser.close()
 
 
+def _frames(page, domains: list[str] | None):
+    """The page, then its embedded frames on the login's allowed domains. Some portals
+    (Schwab) put the login form in an iframe; a frame from any other site is never used,
+    so a password is only ever typed into an allowed site."""
+    out = [page]
+    if not domains:
+        return out
+    for f in page.frames:
+        try:
+            if f != page.main_frame and f.url and host_allowed(f.url, domains):
+                out.append(f)
+        except Exception:
+            continue
+    return out
+
+
+def _login_scope(page, domains: list[str] | None, steps: dict):
+    """The page or allowed frame holding the login form (password or username field)."""
+    pw_sel = steps.get("password_selector") or "input[type=password]"
+    sels = [pw_sel, USERNAME_FIELDS] + ([steps["username_selector"]] if steps.get("username_selector") else [])
+    for scope in _frames(page, domains):
+        if any(_visible(scope.locator(sel)) for sel in sels):
+            return scope
+    return page
+
+
 def _find_username(page, steps: dict):
     """The username field, or None. Saved selector first, then common names, then
-    the text field in the same form as the password."""
+    the text field in the same form as the password. `page` may be a frame."""
     candidates = []
     if steps.get("username_selector"):
         candidates.append(page.locator(steps["username_selector"]))
@@ -276,10 +308,12 @@ SUBMIT_BUTTONS = ("button[type=submit], input[type=submit], button:has-text('Con
                   " [role=button]:has-text('Log in'), [role=button]:has-text('Sign in')")
 
 
-def _submit(page, field, steps: dict) -> None:
-    """Submit the login step: saved button, else Enter, else the step's sign-in button."""
-    if steps.get("submit_selector") and _visible(page.locator(steps["submit_selector"])):
-        page.click(steps["submit_selector"], timeout=15000)
+def _submit(page, field, steps: dict, scope=None) -> None:
+    """Submit the login step: saved button, else Enter, else the step's sign-in button.
+    scope is the frame holding the form, when it's in one."""
+    scope = scope or page
+    if steps.get("submit_selector") and _visible(scope.locator(steps["submit_selector"])):
+        scope.locator(steps["submit_selector"]).first.click(timeout=15000)
         return
     url = page.url
     field.press("Enter")
@@ -293,7 +327,7 @@ def _submit(page, field, steps: dict) -> None:
             return              # the page moved on without changing its URL
     except Exception:
         return
-    buttons = page.locator(SUBMIT_BUTTONS)
+    buttons = scope.locator(SUBMIT_BUTTONS)
     for i in range(min(buttons.count(), 5)):
         b = buttons.nth(i)
         if b.is_visible():
@@ -301,25 +335,35 @@ def _submit(page, field, steps: dict) -> None:
             return
 
 
-def _classify(page) -> str:
-    has_pw = (_visible(page.locator("input[type=password]"))
-              or _visible(page.locator(USERNAME_FIELDS)))   # username-first login page
-    has_otp = _visible(page.locator("input[autocomplete='one-time-code']"))
+def _classify(page, domains: list[str] | None = None) -> str:
+    """Also looks inside embedded frames on the allowed domains, where some portals put
+    their login form; without that, a login page in a frame looked signed in."""
+    scopes = _frames(page, domains)
+    has_pw = any(_visible(s.locator("input[type=password]"))
+                 or _visible(s.locator(USERNAME_FIELDS)) for s in scopes)   # username-first too
+    has_otp = any(_visible(s.locator("input[autocomplete='one-time-code']")) for s in scopes)
+    text = _body_text(page)[:5000]
+    for f in scopes[1:]:
+        try:
+            text += "\n" + f.inner_text("body", timeout=5000)[:2000]
+        except Exception:
+            pass
     frames = [f.url for f in page.frames]
-    return classify_page(_body_text(page)[:5000], has_pw, has_otp, frames)
+    return classify_page(text, has_pw, has_otp, frames)
 
 
 def _login(holder: _Holder, login: dict, creds: dict | None, steps: dict,
            ctx: FetchContext) -> None:
     page, trace = holder.page, ctx.trace
-    if page.url in ("", "about:blank") or not host_allowed(page.url, registry.domains(login)):
+    domains = registry.domains(login)
+    if page.url in ("", "about:blank") or not host_allowed(page.url, domains):
         trace.add("goto_login", url=login["login_url"])
         _PageAdapter(holder).goto(login["login_url"])
         page = holder.page
 
     counted = False
     for _ in range(5):   # user ID page, password page, then possibly a 2FA page
-        state = _classify(page)
+        state = _classify(page, domains)
         trace.add("page_state", state=state, url=page.url)
         if state == "ok":
             return
@@ -343,7 +387,10 @@ def _login(holder: _Holder, login: dict, creds: dict | None, steps: dict,
             store.record_login(ctx.conn, login["id"], ctx.run_kind)
             counted = True
         pw_sel = steps.get("password_selector") or "input[type=password]"
-        user = _find_username(page, steps)
+        scope = _login_scope(page, domains, steps)
+        if scope is not page:
+            trace.add("login_form_in_frame", url=scope.url)
+        user = _find_username(scope, steps)
         if user is not None:
             try:
                 if not user.input_value():          # leave a remembered user ID alone
@@ -352,24 +399,23 @@ def _login(holder: _Holder, login: dict, creds: dict | None, steps: dict,
                 trace.add("username_fill_failed")
         else:
             trace.add("username_field_not_found")
-        if not _visible(page.locator(pw_sel)):
+        if not _visible(scope.locator(pw_sel)):
             # Two-step login: submit the user ID, then wait for the password page.
             if user is None:
                 raise FetchStopped("login_failed", "Couldn't find the username or password field. "
                                    "Add the field selectors under Accounts & logins → login steps.")
             trace.add("submit_username")
-            _submit(page, user, steps)
+            _submit(page, user, steps, scope)
             _settle(page)
             holder.check()
             page = holder.page
-            try:
-                page.locator(pw_sel).first.wait_for(state="visible", timeout=20000)
-            except Exception:
+            scope = _wait_for_password(page, domains, pw_sel, steps)
+            if scope is None:
                 continue    # maybe a 2FA, CAPTCHA or other page: classify it next
-        pw = page.locator(pw_sel).first
+        pw = scope.locator(pw_sel).first
         pw.fill(creds["password"])
         trace.add("submit_login")     # values are never traced
-        _submit(page, pw, steps)
+        _submit(page, pw, steps, scope)
         try:                          # give the portal time to move past the password page
             pw.wait_for(state="hidden", timeout=20000)
         except Exception:
@@ -377,11 +423,47 @@ def _login(holder: _Holder, login: dict, creds: dict | None, steps: dict,
         _settle(page)
         holder.check()
         page = holder.page
-        if _classify(page) == "login":
+        if _classify(page, domains) == "login":
+            message = _login_message(page, domains)
+            trace.add("login_rejected", message=message or "(no message shown)")
             raise FetchStopped("login_failed", "The portal is still showing the login form after "
                                "signing in. Check the saved username and password. Not retrying, "
                                "to avoid a lockout.")
     raise FetchStopped("unexpected", "Login didn't finish after several pages.")
+
+
+LOGIN_MESSAGE = ("[role=alert], [aria-live=assertive], [aria-live=polite], .error, .alert,"
+                 " [class*='error' i], [id*='error' i], [class*='alert' i]")
+
+
+def _login_message(page, domains) -> str | None:
+    """The message the portal shows next to its login form after a failed sign-in
+    (e.g. "incorrect password" vs a generic "unable to process"), for the Debug tab.
+    Page text only: typed values aren't part of it."""
+    for scope in _frames(page, domains):
+        try:
+            loc = scope.locator(LOGIN_MESSAGE)
+            for i in range(min(loc.count(), 10)):
+                el = loc.nth(i)
+                if el.is_visible():
+                    t = " ".join(el.inner_text(timeout=2000).split())
+                    if 3 < len(t) < 400:
+                        return t[:300]
+        except Exception:
+            continue
+    return None
+
+
+def _wait_for_password(page, domains, pw_sel: str, steps: dict, timeout_s: float = 20):
+    """The page or allowed frame where the password field shows up, or None."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        scope = _login_scope(page, domains, steps)
+        if _visible(scope.locator(pw_sel)):
+            return scope
+        if time.monotonic() > deadline:
+            return None
+        page.wait_for_timeout(500)
 
 
 # "How would you like to receive it?" pages: pick text message, then the send button.
@@ -465,7 +547,8 @@ def _two_factor(holder: _Holder, login: dict, ctx: FetchContext) -> None:
             else:
                 try:
                     code = sms.wait_for_code(since - timedelta(seconds=30 if on_code_page else 2),
-                                             should_stop=lambda: config.KILL_FILE.exists())
+                                             should_stop=lambda: config.KILL_FILE.exists()
+                                             or ctx.should_cancel())
                     if code:
                         trace.add("sms_code_read")          # never the code itself
                     else:
@@ -474,6 +557,7 @@ def _two_factor(holder: _Holder, login: dict, ctx: FetchContext) -> None:
                     why = str(e) + " "
     else:
         why = f"Automatic reading of {method} codes isn't built yet. "
+    holder.check()        # cancelled (or kill switch) while waiting for a text
     if not code:
         code = ctx.request_code(f"{login['institution']} is asking for a verification code for "
                                 f"the {login['name']} login. {why}Enter the code you received.")
@@ -627,7 +711,7 @@ def _account_details(holder: _Holder, pages: list[dict], domains: list[str],
                     trace.add("account_detail_missing", label=link["label"][:80])
                     continue
                 adapter.click(target["id"])
-            if _classify(holder.page) != "ok":
+            if _classify(holder.page, domains) != "ok":
                 trace.add("account_detail_stopped", label=link["label"][:80])
                 break             # signed out or a prompt appeared: keep what we have
             n += 1

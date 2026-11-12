@@ -26,7 +26,7 @@ def select_logins(conn, kind: str, login_ids: list[int] | None = None) -> list[d
         return [lg for lg in logins if lg["id"] in login_ids]
     if kind == "refresh":
         return [lg for lg in logins if lg["holds_public"]]
-    return [lg for lg in logins if lg["cadence"] == "nightly"]   # quarterly funds: Stage 4
+    return [lg for lg in logins if lg["cadence"] == "nightly"]
 
 
 def run_logins(conn, kind: str, model_loader: Callable[[], object],
@@ -43,10 +43,17 @@ def run_logins(conn, kind: str, model_loader: Callable[[], object],
     counts: dict[str, int] = {}
     chosen = select_logins(conn, kind, login_ids)
     store.set_run_logins(conn, run_id, [lg["id"] for lg in chosen])
-    for login in chosen:
+    cancelled = lambda: store.cancel_requested(conn, run_id)    # the user pressed Cancel
+    not_started = 0
+    for n, login in enumerate(chosen):
+        if cancelled():
+            not_started = len(chosen) - n
+            break
         item = store.start_run_item(conn, run_id, login["id"])
         ctx = FetchContext(conn=conn, run_kind=kind, model_loader=model_loader,
-                           request_code=lambda reason, lg=login: _ask_for_code(conn, lg, reason))
+                           request_code=lambda reason, lg=login: _ask_for_code(conn, lg, reason,
+                                                                               cancelled),
+                           should_cancel=cancelled)
         where = {"institution": login["institution"], "account": login["name"],
                  "login_id": login["id"]}
         outcome, detail, evidence = "error", "", None
@@ -54,6 +61,8 @@ def run_logins(conn, kind: str, model_loader: Callable[[], object],
             creds = registry.get_credentials(conn, login["id"])
             ev = fetcher(login, creds, ctx)
             evidence = ev.folder
+            if cancelled():       # captured, but not read: nothing from this login is stored
+                raise FetchStopped("cancelled", "Cancelled by you before the pages were read.")
             graph = build_ingest_graph(model_loader(), conn)
             out = graph.invoke({"text": ev.text, "evidence": ev.folder, "login": login,
                                 "source": "portal", "run_id": run_id,
@@ -74,11 +83,12 @@ def run_logins(conn, kind: str, model_loader: Callable[[], object],
                     f"Save this route for {login['institution']}: {ev.proposal['why']}",
                     evidence=ev.folder, payload=ev.proposal, **where)
         except FetchStopped as e:
-            outcome, detail = "stopped", e.message
-            evidence = getattr(e, "evidence_folder", None)
-            counts["stopped"] = counts.get("stopped", 0) + 1
+            outcome = "cancelled" if e.kind == "cancelled" else "stopped"
+            detail = e.message
+            evidence = evidence or getattr(e, "evidence_folder", None)
+            counts[outcome] = counts.get(outcome, 0) + 1
             kind_ = "alert" if e.kind in FetchStopped.ALERT_KINDS else "question"
-            if e.kind != "kill":
+            if e.kind not in ("kill", "cancelled"):
                 store.add_inbox_item(conn, kind_, e.message, payload={"stop": e.kind}, **where)
         except Exception as e:   # not covered by the rules: ask the user (spec D9)
             outcome, detail = "error", f"{type(e).__name__}: {e}"
@@ -89,17 +99,25 @@ def run_logins(conn, kind: str, model_loader: Callable[[], object],
                 f"{detail[:300]}. What should change?", payload={"stop": "unexpected"}, **where)
         store.finish_run_item(conn, item, outcome, detail, ctx.trace.steps, evidence)
 
+    if not_started:
+        counts["not started"] = not_started
     summary = ", ".join(f"{n} {k}" for k, n in sorted(counts.items())) or "no logins due"
-    store.finish_run(conn, run_id, "done", summary)
+    if cancelled():
+        store.finish_run(conn, run_id, "cancelled", "Cancelled by you. " + summary)
+    else:
+        store.finish_run(conn, run_id, "done", summary)
     return run_id
 
 
-def _ask_for_code(conn, login: dict, reason: str) -> str | None:
+def _ask_for_code(conn, login: dict, reason: str, cancelled=lambda: False) -> str | None:
     """Ask in the inbox and wait for the user's code (spec C12 fallback)."""
     item = store.add_inbox_item(conn, "twofa_code", reason, institution=login["institution"],
                                 account=login["name"], login_id=login["id"])
     deadline = time.monotonic() + config.TWOFA_WAIT_S
     while time.monotonic() < deadline:
+        if cancelled():
+            store.resolve_inbox_item(conn, item, "expired")
+            raise FetchStopped("cancelled", "Cancelled by you while waiting for a code.")
         code = store.take_answer(conn, item)
         if code:
             return code

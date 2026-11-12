@@ -19,9 +19,9 @@ from .timeutil import now_iso
 
 ACCOUNT_TYPES = {"brokerage", "retirement", "wealth_management", "private_fund", "bank", "loan",
                  "credit_card", "other"}
-ACCESS_METHODS = {"browser", "api", "email_statement", "manual"}
+ACCESS_METHODS = {"browser", "upload", "api", "email_statement", "manual"}   # upload: you upload statements
 TWOFA_METHODS = {"remembered_device", "sms", "email", "authenticator"}
-CADENCES = {"nightly", "quarterly"}
+CADENCES = {"nightly", "monthly", "quarterly"}
 LOGIN_STATUSES = {"active", "closed"}
 ACCOUNT_STATUSES = {"active", "pending", "ignored", "closed"}
 

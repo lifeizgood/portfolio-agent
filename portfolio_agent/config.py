@@ -12,6 +12,12 @@ DB_PATH = Path(os.getenv("PA_DB_PATH", DATA_DIR / "portfolio.db"))
 
 # Evidence (screenshots, page HTML/text) saved for View Source.
 EVIDENCE_DIR = Path(os.getenv("PA_EVIDENCE_DIR", PRIVATE_DIR / "evidence"))
+# Statements the user uploads (PDFs), kept for View Source. Owner-only folder.
+STATEMENTS_DIR = Path(os.getenv("PA_STATEMENTS_DIR", PRIVATE_DIR / "statements"))
+MAX_UPLOAD_MB = int(os.getenv("PA_MAX_UPLOAD_MB", "50"))
+# Statement text handed to the extractor. A consolidated statement for several
+# accounts runs long; past this, the rest is cut and the run says so.
+STATEMENT_MAX_CHARS = int(os.getenv("PA_STATEMENT_MAX_CHARS", "80000"))
 # Persistent browser profiles, one per institution, so a remembered device stays remembered.
 BROWSER_PROFILES_DIR = Path(os.getenv("PA_BROWSER_DIR", PRIVATE_DIR / "browser"))
 
@@ -26,7 +32,7 @@ KILL_FILE = Path(os.getenv("PA_KILL_FILE", PRIVATE_DIR / "STOP"))
 #   Qwen/Qwen2.5-32B-Instruct  ~65GB, best JSON/format following, slower
 #   Qwen/Qwen2.5-7B-Instruct   ~15GB, fastest
 MODEL_ID = os.getenv("PA_MODEL_ID", "Qwen/Qwen2.5-14B-Instruct")
-MAX_NEW_TOKENS = int(os.getenv("PA_MAX_NEW_TOKENS", "4096"))   # room for several accounts
+MAX_NEW_TOKENS = int(os.getenv("PA_MAX_NEW_TOKENS", "8192"))   # room for a statement with ~100 holdings
 
 # Q&A ReAct loop. The spec drops the Q&A step budget in favor of a 30 s limit
 # (C7, D13); Q&A arrives in Stage 12, so the old cap stays until then.
@@ -64,6 +70,7 @@ PORTAL_MAX_AGE_DAYS = int(os.getenv("PA_PORTAL_MAX_AGE_DAYS", "5"))   # clock sk
 
 # Staleness: nightly accounts need a value retrieved within this many hours.
 STALE_HOURS_NIGHTLY = int(os.getenv("PA_STALE_HOURS", "30"))
+STALE_DAYS_MONTHLY = int(os.getenv("PA_STALE_DAYS_MONTHLY", "45"))   # monthly statements
 
 # Dashboard server: localhost only.
 HOST = "127.0.0.1"

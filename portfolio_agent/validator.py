@@ -37,8 +37,10 @@ def validate(snap: Snapshot, previous: Snapshot | None = None,
         warnings.append("No stated total to reconcile against.")
 
     for h in snap.holdings:
-        # V4 sign: assets are never negative; a liability (owed) is never positive
-        if not liability and h.value < 0:
+        # V4 sign: a liability (owed) is never positive. In an asset account a single
+        # holding may be negative (options written, cash borrowed on margin) only when
+        # the account shows a total for V2 to check the sum against.
+        if not liability and h.value < 0 and not snap.statement_total:
             errors.append(f"Negative value for {h.description}.")
         if liability and h.value > 0:
             errors.append(f"Positive value for {h.description} on a liability account.")
@@ -49,7 +51,10 @@ def validate(snap: Snapshot, previous: Snapshot | None = None,
         # V3 qty x price vs the portal's own value (no market feed, spec C3)
         if h.quantity is not None and h.price is not None and h.value:
             implied = h.quantity * h.price
-            if abs(implied - h.value) / abs(h.value) > config.VALUE_TOLERANCE:
+            off = lambda x: abs(x - h.value) / abs(h.value)
+            if off(implied) > config.VALUE_TOLERANCE and off(implied * 100) <= config.VALUE_TOLERANCE:
+                implied *= 100    # an option: price per share, 100 shares per contract
+            if off(implied) > config.VALUE_TOLERANCE:
                 errors.append(f"{h.description}: {h.quantity} x {h.price} = {implied:,.2f},"
                               f" but value is {h.value:,.2f}.")
 

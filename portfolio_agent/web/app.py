@@ -45,6 +45,10 @@ class KillIn(BaseModel):
     on: bool
 
 
+class ReadUploadsIn(BaseModel):
+    upload_ids: list[int]
+
+
 _START_LOCK = threading.Lock()
 
 
@@ -316,7 +320,79 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
             raise HTTPException(400, "Only an active browser login can be refreshed.")
         return start_refresh(c, [lid])
 
+    # --- uploaded statements ----------------------------------------------------
+
+    @app.get("/api/logins/{lid}/statements")
+    def list_statements(lid: int, c=Depends(conn)):
+        if not registry.get_login(c, lid):
+            raise HTTPException(404)
+        return [_upload_view(u) for u in store.list_uploads(c, lid)]
+
+    @app.post("/api/logins/{lid}/statements")
+    async def upload_statement(lid: int, request: Request, c=Depends(conn)):
+        """One PDF per request, sent as the raw body; X-Filename carries its name."""
+        from urllib.parse import unquote
+
+        from ..statements import UploadError, save_upload
+        lg = registry.get_login(c, lid)
+        if not lg:
+            raise HTTPException(404)
+        if lg["status"] != "active":
+            raise HTTPException(400, "This login is closed.")
+        size = int(request.headers.get("content-length") or 0)
+        if size > config.MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(413, f"The file is over {config.MAX_UPLOAD_MB} MB.")
+        data = await request.body()
+        try:
+            up = save_upload(c, lg, unquote(request.headers.get("x-filename") or ""), data)
+        except UploadError as e:
+            raise HTTPException(400, str(e))
+        return _upload_view(up)
+
+    @app.post("/api/logins/{lid}/statements/read")
+    def read_statements(lid: int, body: ReadUploadsIn, c=Depends(conn)):
+        """Read the given uploads with the model, in the background, as one run."""
+        from ..statements import read_uploads
+        lg = registry.get_login(c, lid)
+        if not lg:
+            raise HTTPException(404)
+        ids = list(dict.fromkeys(body.upload_ids))
+        ups = [store.get_upload(c, i) for i in ids]
+        if not ids or any(u is None or u["login_id"] != lid for u in ups):
+            raise HTTPException(400, "Unknown statement for this login.")
+        _expire_stuck_runs(c)
+        with _START_LOCK:
+            if lid in store.busy_login_ids(c):
+                raise HTTPException(409, "This login is already being refreshed or read.")
+            run_id = store.start_run(c, "upload")
+            store.set_run_logins(c, run_id, [lid], "login")
+
+        def work():
+            wc = store.connect(db_path)
+            try:
+                read_uploads(wc, run_id, lg, ids, loader)
+            except Exception as e:   # keep the run from looking stuck
+                store.finish_run(wc, run_id, "failed", f"{type(e).__name__}: {e}")
+            finally:
+                wc.close()
+
+        if run_in_thread:
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            work()
+        return {"run_id": run_id}
+
+    @app.get("/api/statements/{uid}/file")
+    def statement_file(uid: int, c=Depends(conn)):
+        up = store.get_upload(c, uid)
+        if not up or not Path(up["path"]).is_file():
+            raise HTTPException(404)
+        return FileResponse(up["path"], media_type="application/pdf",
+                            headers={"Content-Security-Policy": "sandbox",
+                                     "X-Content-Type-Options": "nosniff"})
+
     def start_refresh(c, login_ids: list[int] | None) -> dict:
+        dashboard = login_ids is None
         """Refreshes run in parallel, one per institution at a time (logins at one
         institution share a browser profile), up to MAX_PARALLEL_RUNS at once."""
         _expire_stuck_runs(c)
@@ -337,7 +413,8 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
                 if due and not login_ids:
                     raise HTTPException(409, "Every login is already being refreshed.")
             run_id = store.start_run(c, "refresh")
-            store.set_run_logins(c, run_id, login_ids)
+            store.set_run_logins(c, run_id, login_ids,
+                                 "dashboard" if dashboard else "login")
 
         def work():
             wc = store.connect(db_path)
@@ -354,6 +431,15 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
         else:
             work()
         return {"run_id": run_id}
+
+    @app.post("/api/runs/{rid}/cancel")
+    def cancel_run(rid: int, c=Depends(conn)):
+        """Cancel button: the run stops at its next check; values it already stored stay."""
+        if not store.get_run(c, rid):
+            raise HTTPException(404)
+        if not store.request_cancel(c, rid):
+            raise HTTPException(409, "This run has already finished.")
+        return {"ok": True}
 
     @app.get("/api/runs")
     def runs(limit: int = 100, c=Depends(conn)):
@@ -396,6 +482,12 @@ def _open_item(c, iid: int) -> dict:
     if not item or item["status"] != "open":
         raise HTTPException(404, "No open item with that id.")
     return item
+
+
+def _upload_view(up: dict) -> dict:
+    """An upload as the UI shows it; the file's location stays on the server."""
+    return {k: up.get(k) for k in ("id", "filename", "size", "uploaded_at", "run_id",
+                                   "outcome", "detail", "duplicate")}
 
 
 def _expire_stuck_runs(c) -> None:

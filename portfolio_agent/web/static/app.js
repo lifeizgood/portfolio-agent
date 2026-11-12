@@ -279,12 +279,41 @@ async function watchRun(id) {
   loadDashboard();
 }
 
-$("#refresh-btn").addEventListener("click", async () => {
+$("#refresh-btn").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  if (btn.dataset.run) return cancelRun(btn, (t) => { $("#refresh-status").textContent = t; });
+  btn.disabled = true;
   try {
     const { run_id } = await api("/api/refresh", { method: "POST" });
     watchRun(run_id);
-  } catch (e) { $("#refresh-status").textContent = e.message; }
+  } catch (e) { $("#refresh-status").textContent = e.message; syncRefreshButtons(); }
 });
+
+// A Refresh button turns into Cancel while its run is going. Cancel stops the run at
+// its next check (between pages, while waiting for a code, or before the captured
+// pages are read); accounts the model is already reading finish first.
+async function cancelRun(btn, report) {
+  btn.disabled = true; btn.textContent = "Cancelling…";
+  try { await api(`/api/runs/${btn.dataset.run}/cancel`, { method: "POST" }); }
+  catch (err) { report(err.message); }
+  syncRefreshButtons();
+}
+function setRunButton(btn, run, idleDisabled, idleTitle) {
+  if (run) {
+    btn.dataset.run = run.id;
+    btn.textContent = run.cancel_requested ? "Cancelling…" : "Cancel";
+    btn.disabled = !!run.cancel_requested;
+    btn.classList.remove("primary");
+    btn.title = run.cancel_requested ? "Stopping at the next safe point"
+      : run.kind === "upload" ? "Stop reading statements (the one being read finishes first)" : "Stop this refresh";
+  } else {
+    delete btn.dataset.run;
+    btn.textContent = btn.dataset.idle || "Refresh";
+    btn.disabled = idleDisabled;
+    btn.classList.add("primary");
+    btn.title = idleTitle;
+  }
+}
 $("#kill-off").addEventListener("click", async () => { await api("/api/kill", { method: "POST", body: { on: false } }); loadSummary(); });
 
 function loadDashboard() { loadSummary(); loadChart(); loadPositions(); }
@@ -361,20 +390,38 @@ async function loadAccounts() {
   for (const lg of logins) {
     const tr = document.createElement("tr");
     const canRefresh = lg.status === "active" && lg.access_method === "browser";
+    const canUpload = lg.status === "active" && lg.access_method === "upload";
     tr.innerHTML = `<td class="clip" title="${esc(lg.name)}">${esc(lg.name)}</td><td class="clip" title="${esc(lg.institution)}">${esc(lg.institution)}</td><td>${lg.accounts.length}</td>
       <td>${esc(lg.cadence)}</td><td>${lg.has_credentials ? "yes" : "no"}</td>
       <td>${when(lg.last_fetched)}</td>
       <td class="row"><button data-act="edit">Edit</button>
-        <button class="primary" data-act="refresh" data-lid="${lg.id}" data-can="${canRefresh ? 1 : 0}" ${canRefresh ? "" : "disabled"}>Refresh</button>
+        ${lg.access_method === "upload"
+          ? `<button class="primary" data-act="upload" data-idle="Upload statements" data-lid="${lg.id}" data-can="${canUpload ? 1 : 0}" ${canUpload ? "" : "disabled"} title="Upload this month's statement PDFs: one per account or one consolidated">Upload statements</button><input type="file" accept=".pdf,application/pdf" multiple hidden>`
+          : `<button class="primary" data-act="refresh" data-lid="${lg.id}" data-can="${canRefresh ? 1 : 0}" ${canRefresh ? "" : "disabled"}>Refresh</button>`}
         <span class="msg ${loginMsg[lg.id]?.err ? "err" : ""}">${esc(loginMsg[lg.id]?.text || "")}</span></td>`;
     tr.dataset.lid = lg.id;
     tr.querySelector("[data-act=edit]").addEventListener("click", () => openForm(lg));
-    tr.querySelector("[data-act=refresh]").addEventListener("click", (e) => refreshLogin(lg, e.currentTarget));
+    tr.querySelector("[data-act=refresh]")?.addEventListener("click", (e) => {
+      const b = e.currentTarget;
+      if (b.dataset.run) cancelRun(b, (t) => setLoginMsg(lg.id, t, true));
+      else refreshLogin(lg, b);
+    });
+    const file = tr.querySelector("input[type=file]");
+    tr.querySelector("[data-act=upload]")?.addEventListener("click", (e) => {
+      const b = e.currentTarget;
+      if (b.dataset.run) cancelRun(b, (t) => setLoginMsg(lg.id, t, true));
+      else file.click();
+    });
+    file?.addEventListener("change", () => {
+      const files = [...file.files]; file.value = "";
+      if (files.length) uploadStatements(lg, tr.querySelector("[data-act=upload]"), files);
+    });
     tb.appendChild(tr);
   }
   if (editing) {
     const lg = logins.find((x) => x.id === editing);
     if (lg && !dirtyRows().length) renderLoginAccounts(lg);   // never drop unsaved edits
+    if (lg) loadStatements(lg);
   }
   syncRefreshButtons();
 }
@@ -391,13 +438,16 @@ function setLoginMsg(id, text, err = false) {
 }
 function applyBusy(s) {
   const busy = new Set(s.busy_login_ids || []);
-  document.querySelectorAll("#login-list [data-act=refresh]").forEach((b) => {
-    const isBusy = busy.has(Number(b.dataset.lid));
-    b.disabled = isBusy || b.dataset.can !== "1";
-    b.title = isBusy ? "This institution is being refreshed" : "";
+  const runOf = {};                 // login id -> the running run that covers it
+  for (const r of s.running || []) for (const id of JSON.parse(r.login_ids || "[]")) runOf[id] = r;
+  document.querySelectorAll("#login-list [data-act=refresh], #login-list [data-act=upload]").forEach((b) => {
+    const lid = Number(b.dataset.lid), isBusy = busy.has(lid);
+    setRunButton(b, runOf[lid], isBusy || b.dataset.can !== "1",
+      isBusy ? "Another login at this institution is being refreshed" : "");
   });
-  $("#refresh-btn").disabled = !s.refresh_all_available;
-  $("#refresh-btn").title = s.refresh_all_available ? "" : "Every login is already being refreshed";
+  const dash = (s.running || []).find((r) => r.trigger === "dashboard");
+  setRunButton($("#refresh-btn"), dash, !s.refresh_all_available,
+    s.refresh_all_available ? "" : "Every login is already being refreshed");
 }
 async function syncRefreshButtons() {
   const s = await api("/api/summary");
@@ -436,6 +486,62 @@ async function refreshLogin(lg, btn) {
   if ($("#accounts").classList.contains("active")) loadAccounts();
 }
 
+// Upload statements: send each PDF, then read them all in one run (one file at a time).
+async function uploadStatements(lg, btn, files) {
+  btn.disabled = true;
+  const ids = [], notes = [];
+  try {
+    for (const [n, f] of files.entries()) {
+      setLoginMsg(lg.id, `Uploading ${n + 1} of ${files.length}: ${f.name}…`);
+      const res = await fetch(`/api/logins/${lg.id}/statements`, {
+        method: "POST", body: f,
+        headers: { "X-PA-Client": "1", "Content-Type": "application/pdf", "X-Filename": encodeURIComponent(f.name) } });
+      const up = await res.json().catch(() => ({}));
+      if (!res.ok) { notes.push(`${f.name}: ${up.detail || res.statusText}`); continue; }
+      if (up.duplicate && ["stored", "held", "mixed"].includes(up.outcome)) {
+        notes.push(`${f.name} was already uploaded on ${when(up.uploaded_at)} and read (${up.outcome}); skipped.`);
+        continue;
+      }
+      ids.push(up.id);
+    }
+    if (!ids.length) { setLoginMsg(lg.id, notes.join(" ") || "Nothing to read.", true); btn.disabled = false; return; }
+    const { run_id } = await api(`/api/logins/${lg.id}/statements/read`, { method: "POST", body: { upload_ids: ids } });
+    syncRefreshButtons();
+    while (true) {
+      const r = await api(`/api/runs/${run_id}`);
+      if (r.status !== "running") {
+        const detail = r.items.map((i) => i.detail).filter(Boolean).join(" · ");
+        setLoginMsg(lg.id, [`${r.status}: ${r.summary || ""}`, detail, ...notes].filter(Boolean).join(" · "),
+          r.status !== "done");
+        break;
+      }
+      const done = r.items.filter((i) => i.finished_at).length;
+      setLoginMsg(lg.id, `Reading statement ${Math.min(done + 1, ids.length)} of ${ids.length}… (the model reads every account; this takes a few minutes)`);
+      await new Promise((res) => setTimeout(res, 3000));
+    }
+    loadInboxBadge();
+  } catch (err) { setLoginMsg(lg.id, err.message, true); }
+  syncRefreshButtons();
+  if ($("#accounts").classList.contains("active")) loadAccounts();
+}
+
+async function loadStatements(lg) {
+  const sec = $("#statements-section");
+  sec.hidden = !(lg && lg.access_method === "upload");
+  if (sec.hidden) return;
+  const tb = $("#statement-list tbody");
+  const ups = await api(`/api/logins/${lg.id}/statements`);
+  tb.innerHTML = ups.length ? "" : `<tr><td colspan="4" class="muted">None yet.</td></tr>`;
+  for (const u of ups) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="wrap">${esc(u.filename)}</td><td>${when(u.uploaded_at)}</td>
+      <td class="wrap">${u.outcome ? `<span class="pill ${u.outcome === "stored" ? "ok" : u.outcome === "held" || u.outcome === "mixed" ? "pending" : "needs_review"}">${esc(u.outcome)}</span> ` : `<span class="muted">not read yet</span>`}
+        ${esc((u.detail || "").replace(u.filename + ": ", ""))}</td>
+      <td><a href="/api/statements/${u.id}/file" target="_blank" rel="noopener">Open</a></td>`;
+    tb.appendChild(tr);
+  }
+}
+
 function openForm(lg) {
   const n = dirtyRows().length;
   if (n && !confirm(`${n} account change${n > 1 ? "s are" : " is"} not saved. Discard ${n > 1 ? "them" : "it"}?`)) return;
@@ -454,13 +560,16 @@ function openForm(lg) {
   $("#cred-section").hidden = !lg;
   const cf = $("#cred-form"); cf.reset(); cf.password.type = "password"; revealed = false;
   $("#cred-msg").textContent = lg?.has_credentials ? "Saved. Use the eye to view them." : "";
-  if (lg) { $("#open-browser-cmd").textContent = `python -m portfolio_agent.cli open-browser ${lg.id}`; renderLoginAccounts(lg); }
+  if (lg) { $("#open-browser-cmd").textContent = `.venv/bin/python -m portfolio_agent.cli open-browser ${lg.id}`; renderLoginAccounts(lg); }
+  loadStatements(lg);
   $("#login-form-card").scrollIntoView({ behavior: "smooth" });
 }
 
 function renderLoginAccounts(lg) {
   const tb = $("#login-accounts tbody"); tb.innerHTML = "";
-  if (!lg.accounts.length) tb.innerHTML = `<tr><td colspan="10" class="muted">None yet. Press Refresh; accounts are found on the login's holdings page.</td></tr>`;
+  if (!lg.accounts.length) tb.innerHTML = `<tr><td colspan="10" class="muted">None yet. ${lg.access_method === "upload"
+    ? "Upload a statement; the accounts in it are found automatically."
+    : "Press Refresh; accounts are found on the login's holdings page."}</td></tr>`;
   for (const a of lg.accounts) {
     const tr = document.createElement("tr");
     const portal = `${a.portal_name || ""}${a.portal_suffix ? " …" + a.portal_suffix : ""}`;
@@ -699,7 +808,7 @@ async function loadDebug() {
     tr.className = "clickable";
     tr.innerHTML = `<td>${r.id}</td><td>${esc(r.kind)}</td><td>${when(r.started_at)}</td>
       <td>${took(r.started_at, r.finished_at)}</td><td>${esc(r.login_names || r.logins)}</td>
-      <td><span class="pill ${r.status === "done" ? "ok" : r.status === "running" ? "stale" : "needs_review"}">${esc(r.status)}</span></td>
+      <td><span class="pill ${r.status === "done" ? "ok" : r.status === "running" ? "stale" : r.status === "cancelled" ? "closed" : "needs_review"}">${esc(r.status)}</span></td>
       <td>${esc(r.summary || "")}</td>`;
     tr.addEventListener("click", () => showRun(r.id));
     tb.appendChild(tr);
