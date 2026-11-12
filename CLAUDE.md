@@ -25,7 +25,7 @@ A personal portfolio tracker that runs only on this Mac. Playwright signs in to 
 ```
 
 - **API:** every request other than GET needs the header `X-PA-Client: 1`. For example, `PUT /api/logins/{id}` saves a login's rules and `PUT /api/accounts/{id}` saves an account.
-- **The owner runs `serve` in their own terminal.** After backend changes, ask them to restart it. Front-end files (`web/static/`) only need a browser reload.
+- **The owner runs `serve` in their own terminal.** After backend changes, ask them to restart it. A statement read by a server started before the change still uses the old code. Front-end files (`web/static/`) only need a browser reload.
 - **`node` is not installed.** Check JavaScript syntax with `osascript -l JavaScript`, or by loading the page in the browser pane and reading the console.
 - **Demos:** for UI checks, build a throwaway database with made-up accounts in the scratchpad and preview it on another port (e.g. 8798/8799). Remove any temporary `.claude/launch.json` entry afterwards.
 
@@ -39,4 +39,7 @@ A personal portfolio tracker that runs only on this Mac. Playwright signs in to 
   View Source, the validator (`previous_snapshot` / `_to_snapshot`) and the holdings list use full values. Never fold either adjustment into stored rows.
 - **Per-login rules** (`skip_categories`, `liability_categories`, `skip_other_institutions`, `open_account_details`) also apply to existing accounts, through `registry.apply_login_rules`.
 - **Code reads account numbers, not the model.** They come from each account's details page (`browser/portal.py`) and are matched by link name. They override the model's guess, and the validator rejects one number given to several accounts.
+- **Statements:** code reads a one-account statement's number (`statement_guides.statement_number`), overriding the model. `registry.relink_accounts` (moving an account to a newly read number) runs for portal pages only, never for statements: one statement covers one account, so another account with the same name is simply not in it.
+- **Signs:** in an asset account each holding keeps its own sign; only liabilities are forced negative (`ingest_graph._snapshot`). A sold option (negative quantity) is valued in code at −(contracts × 100 × price) (`value_sold_options`), whatever the statement prints.
+- **Duplicate statements:** a file is ignored only if it was ingested (`statements.ingested`); otherwise it's read again. A re-read with identical values is "unchanged" and adds no row.
 - **Parallel refreshes:** logins at the same institution share a browser profile, so they never run at the same time (`store.busy_login_ids`). The model is used by one run at a time (`llm.py`).

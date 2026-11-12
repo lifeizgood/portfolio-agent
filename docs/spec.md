@@ -45,7 +45,8 @@ Where a ruling (`[U]`) conflicts with a checkpoint doc, the ruling wins. If none
 |---|---|---|
 | Financial portals (brokerage, wealth mgmt, retirement, private fund) | Sandboxed browser with a persistent profile per institution | Read-only; domain allowlist |
 | Institution APIs | Used when the user picks API as an account's access method [U D1]. Third-party aggregators are excluded, because extracted data would leave the Mac [U C13] | Read-only scopes |
-| Email: statements | One labeled folder, filtered to registry senders. Holds capital-statement PDFs and the separate emails carrying their passwords [2.1, U D8] | Read-only |
+| Email: statements | One labeled folder, filtered to registry senders. Holds capital-statement PDFs and the separate emails carrying their passwords [2.1, U D8]; from Stage 13 also monthly brokerage statements [U, 2026-11-12] | Read-only |
+| Uploaded statements | Monthly PDF statements the user uploads in the dashboard, for institutions whose portal can't be read daily (Stage 1). Saved privately and read like any other evidence [U, 2026-11-12] | Read-only |
 | Email: 2FA codes | Code-only reader; may search **any label**, but only to fetch a 2FA code for a login it just started [U C12] | Read-only; one message, short window |
 | Text messages | Code-only reader of the Messages database for SMS 2FA; filters by time window [U D2]. Never exposed to the LLM | Read-only; one message, short window |
 | Market data / research data | Looked up by ticker symbol only, never with quantities, values or account details [U C14]. Not used for validation [U C3] | Public, read-only |
@@ -119,14 +120,16 @@ Trend lines, charting and date selection are present from Stage 1.
 | 10 | Manual inputs for specific accounts |
 | 11 | Auto-discover trends, with explanations |
 | 12 | Q&A about trends |
+| 13 | **Brokerage statements by email.** Monthly statements for accounts without daily access (e.g. Rockefeller, Schwab) are picked up from the labeled mail folder and read automatically, through the same reader as uploaded statements. Manual upload then remains only as a fallback, e.g. for a statement that never arrived by email [U, 2026-11-12] |
 
 **Where each component first appears:**
 
-- **Stage 1:** portal fetcher, extractor, validator, store, registry/credential UI, dashboard, nightly run and Refresh.
+- **Stage 1:** portal fetcher, extractor, validator, store, registry/credential UI, dashboard, nightly run and Refresh. Added during Stage 1: **statement upload** for logins that can't be read daily, with per-institution statement guides (Rockefeller, Schwab) [U, 2026-11-12].
 - **Stage 4:** capital-statement extraction, roll-forward schema and the roll-forward check (V7).
 - **Stage 7:** statement fetcher and the password email.
 - **Stage 11:** retrieval of investor letters and the trend explanations.
 - **Stage 12:** Q&A, with the research-feed decision revisited [U D12].
+- **Stage 13:** the statement fetcher extended to brokerage statements; it hands each PDF to the existing statement reader (guides, dating rule, duplicate check).
 
 Research-rating flags and the morning summary are dropped for now [U D22].
 
@@ -215,7 +218,7 @@ A boundary between agents sits wherever the tools, permissions or failure behavi
 |---|---|---|---|---|
 | **Orchestrator** (supervisor) | 1 | Reads the registry and the date each account last produced a valid value. Selects accounts due tonight, or the public-security accounts on Refresh. Dispatches workers, routes failures by rule, joins results. | Registry, run state | Run plan; run status |
 | **Portal fetcher** (one per institution) | 1 | Bounded ReAct loop: log in, navigate, capture the holdings page or download the statement, guided by the portal's playbook. Proposes playbook updates; never applies them [U D14]. | Browser, Auth tool, playbook retrieval | Evidence bundle; playbook proposal |
-| **Statement fetcher** | 7 | Finds capital statements in the labeled mail folder. Scans email for the separate password message and opens the PDF. If no password email is found, asks through the inbox and uses the password the user stores [U D8]. | Mail reader, PDF tools, Auth tool | Evidence bundle |
+| **Statement fetcher** | 7, 13 | Finds capital statements (Stage 7) and monthly brokerage statements (Stage 13) in the labeled mail folder. Hands each PDF to the same statement reader as uploads, so the guides, dating rule and duplicate check apply unchanged. Scans email for the separate password message and opens the PDF. If no password email is found, asks through the inbox and uses the password the user stores [U D8]. | Mail reader, PDF tools, Auth tool | Evidence bundle |
 | **Extractor** | 1 | Turns evidence into rows (holding, quantity, price, value, as-of) and, for capital statements, roll-forward fields. Retrieves the user's approved corrections for that fund first. Has no tools that act. | Document parser, corrections retrieval | Candidate snapshot; candidate roll-forward |
 | **Analyst** | 11–12 | Stage 11: discovers trends and writes explanations. Private-fund moves are explained from investor letters only [U D4]. Stage 12: answers questions about trends. Cites numbers from the store and reasons from retrieved letters. Separates "values that changed" from "values that arrived late" before explaining anything [2.1]. | Store queries, calculator, retrieval | Trend explanations; cited answers |
 | **Research agent** | dropped for now | Would collect published ratings for public holdings and flag any not rated Buy [5.1]. Dropped for now [U D22]; the research feed is revisited in Stage 12 [U D12]. If revived, it may look up tickers but never send holdings [U C14]. | Ratings tool, research-note retrieval | Rating flags |
@@ -246,11 +249,13 @@ Every tool returns a structured result with its source. A failure (timeout, page
   - account and holding;
   - `as_of_datetime`, with `as_of_date` derived from it;
   - `retrieved_at_datetime`;
-  - source type: portal, API, email statement or manual;
+  - source type: portal, API, statement (uploaded or, from Stage 7, emailed) or manual;
   - an evidence link.
 - **Append-only.** Each pull is a new row, including several pulls on one day. A restatement is a new row with the same as-of and a later retrieval. Reads use the latest retrieval for each as-of.
+- **One recorded exception (2026-11-12).** Two values filed under the wrong account (before account numbers on statements were read by code) were deleted at the owner's request, after a database backup. This is not a mechanism: corrections are still new rows [U].
+- **Duplicate statements.** The same statement uploaded again (same file, or the same text in a fresh download) is ignored once ingested, and read again if it wasn't. A re-read with identical values for the same account and date is recorded as "unchanged" and adds no row [U, 2026-11-12].
 - **Out-of-order ingestion is allowed.** Data for an older as-of date can arrive after newer data and is accepted [U C4].
-- **Missing time.** If the source has no time of day, the current time is used (§1) [U D16].
+- **Missing time.** If the source has no time of day, the current time is used (§1) [U D16]. A statement must show its date (the closing date of its period); a statement with no date is an error, never dated by the upload time [U, 2026-11-12].
 - **Only validated values are written,** and only by code. A misread number stays in working memory and the review queue; it never becomes a fact that later runs compare against.
 - **Every value has viewable evidence** for View Source [U C5].
 - **Storage.** Plain (unencrypted) storage is acceptable for data. Credentials are always encrypted (§5.5) [U C9].
@@ -258,6 +263,7 @@ Every tool returns a structured result with its source. A failure (timeout, page
 | Entity | Fields |
 |---|---|
 | Snapshot | institution, account (display name, never the account number), `as_of_datetime`, `retrieved_at_datetime`, source type, evidence, statement total |
+| Statement upload | login, file name, private path, file hash, text hash, uploaded at, last run, last outcome. One row per distinct file; an upload is **ingested** when its last read stored or held its values and none was rejected as a misread [U, 2026-11-12] |
 | Holding | symbol (if public), description, quantity, price, value, `price_as_of` (the holding's own date when the portal shows one, e.g. "Last Updated 06/30/2026" for a private fund; may be older than the page, never later) [U] |
 
 *Today's code (`schemas.py`, `store.py`) has both entities with append-only bitemporal reads, but stores `as_of` as a date only. No source type.*
@@ -300,6 +306,7 @@ The user maintains the registry through the UI; agents only read it [U D1].
 - A **login** is one set of portal credentials. One login can hold several accounts, and data is stored per individual account.
 - The login carries the fields below: URL, domains, 2FA, cadence, credentials and steps.
 - Accounts are found on each fetch and matched by name plus the last 4 digits of the account number, if shown.
+- **Account numbers are read by code, not the model:** from each account's details page on a portal, and from the "Account Number" line of a one-account statement. When a portal page reads a new number for an account of the same name, the entry is moved to it; statements never do this, since one statement covers one account [U, 2026-11-12].
 - A new account starts as **pending**, and its first value waits for approval.
 - The user can rename an account, set its type, or mark it **ignored** or **closed**.
 - Every account on a page is kept, including accounts the portal leaves out of its overall total (§7, V11–V12).
@@ -317,12 +324,12 @@ The user maintains the registry through the UI; agents only read it [U D1].
 |---|---|---|
 | Display name | e.g. "Schwab joint brokerage" | Dashboard, summary, Q&A |
 | Institution, account type | Brokerage / retirement / wealth management / private fund | Grouping; cadence |
-| Access method | Browser, API, email statement or manual. Chosen by the user; the system doesn't decide [U D1] | Orchestrator |
+| Access method | Browser, API, email statement, **upload** or manual. Upload: the user uploads monthly PDF statements in the dashboard, for institutions whose portal can't be read daily; nightly runs and Refresh skip these logins. Chosen by the user; the system doesn't decide [U D1, 2026-11-12] | Orchestrator |
 | Login mechanism | Portal URL, credential reference, and the login steps the user enters (Stage 1) [U] | Fetcher; browser allowlist |
 | 2FA method | SMS, email or authenticator app. The Auth tool tries email or SMS first, and asks the user when it can't get the code [U C12] | Auth tool |
 | Statement sender | Full email address of the statement sender | Mail filter |
 | PDF password source | Sender of the password email, or a password the user stores [U D8] | Statement fetcher |
-| Update cadence | Nightly, or quarterly with a 2–4 month lag | Orchestrator; staleness check |
+| Update cadence | Nightly; **monthly** (stale 45 days after the last statement); or quarterly with a 2–4 month lag | Orchestrator; staleness check |
 | Holds public securities | Yes / no; decides whether Refresh includes the account [U] | Refresh |
 | Status | Active, or closed with a close date | Orchestrator; completeness; history |
 
@@ -435,8 +442,8 @@ The validator is deterministic code with no LLM. A snapshot is accepted only if 
 |---|---|---|---|
 | V1 | **Non-empty** | Some holdings were extracted | ✅ hard error |
 | V2 | **Sum to total** | Holding rows sum to the account total shown on the page or statement | ✅ 1% tolerance (`PA_SUM_TOLERANCE`); a missing total is a warning |
-| V3 | **Quantity × price** | qty × price ≈ value for each holding, using the portal's own numbers. **No market-feed check** [U C3] | ✅ 2% tolerance; matches the spec |
-| V4 | **Non-negative values** | (implicit) | ✅ hard error |
+| V3 | **Quantity × price** | qty × price ≈ value for each holding, using the portal's own numbers. For an option, qty × price × 100 (one contract is 100 shares). **No market-feed check** [U C3] | ✅ 2% tolerance; options × 100 |
+| V4 | **Non-negative values** | A negative holding in an asset account is a likely sign misread, except a **sold option** or **margin cash**, allowed when the account has a stated total for V2 to check against. A sold option's value is set in code to −(contracts × 100 × price), whatever sign the statement prints [U, 2026-11-12] | ✅ |
 | V5 | **As-of not in the future** | | ✅ |
 | ~~V6~~ | ~~As-of not earlier than the last accepted value~~ | **Removed.** Out-of-order ingestion is valid [U C4] | ❌ still enforced; must be removed |
 | V7 | **Roll-forward** | Each capital statement reconciles within itself, and with the previous period (§5.2) [6.1, U D5] | ❌ not implemented; no roll-forward schema |
@@ -669,6 +676,18 @@ The owner's ruling on each item from the first version of this spec.
 | D22 | Morning summary, research flags | Dropped for now. | Resolved |
 | D23 | Manual inputs | Yes: same checks, and View Source shows who, when and an optional attachment. | Resolved |
 
+### 13.3 Third round (2026-11-12)
+
+| # | Topic | Ruling | Status |
+|---|---|---|---|
+| S1 | Institutions without daily access | Upload monthly statements (one per account or consolidated) as a login's access method, cadence monthly. Built first for Rockefeller, then Schwab. | Resolved; built |
+| S2 | "Use my Chrome" sign-in | Removed: it didn't work. | Resolved; removed |
+| S3 | Sold options | Value = −(contracts × 100 × price per share), even when the statement prints it positive. | Resolved; built |
+| S4 | Duplicate statements | Allowed. Ignored if already ingested correctly; read again if not. | Resolved; built |
+| S5 | Account numbers on statements | Read by code from the statement; a statement never moves an existing account to another number. | Resolved; built |
+| S6 | Misfiled values | Delete them outright rather than mark them withdrawn (one-off, with a backup). | Resolved; done |
+| S7 | Email for brokerage statements | Add Stage 13: brokerage statements arrive by email and are read automatically; manual upload becomes a fallback. | Planned |
+
 ---
 
 ## 14. Contradictions and open decisions
@@ -710,6 +729,8 @@ The owner's ruling on each item from the first version of this spec.
 | Capital-statement extraction (NAV, excluding unfunded commitment) | ✅ `extractor.py`; no roll-forward fields |
 | ReAct Q&A with read-only tools | ✅ `react_graph.py`, `tools.py`. Needs a 30 s limit instead of `STEP_BUDGET = 8`. Not needed until Stage 12. |
 | Orchestrator, fetchers, Refresh, statement fetcher, Auth tool | ❌ |
+| Statement upload (upload logins, guides, duplicate check, sold options) | ✅ `statements.py`, `statement_guides.py`, `ingest_graph.py` (Stage 1 addition) |
+| Brokerage statements by email | ❌ (Stage 13) |
 | Registry UI, encrypted credentials | ❌ |
 | Dashboard (FastAPI + web front end), charts, IRR / time-weighted returns, View Source, inbox, recommendations file | ❌ |
 | Completeness / stale check | ❌ |

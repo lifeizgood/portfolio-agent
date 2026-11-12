@@ -14,7 +14,7 @@ cd portfolio-agent
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m playwright install chromium   # browser for the portal fetcher
-pytest -q                     # 33 tests, fake model and fake pages, no download needed
+pytest -q                     # 95 tests, fake model and fake pages, no download needed
 code .
 ```
 
@@ -40,6 +40,14 @@ python -m portfolio_agent.cli serve      # dashboard at http://127.0.0.1:8765
    - Rename an account, change its type, or set it to **ignored** under Accounts & logins.
    - If the portal asks for a verification code, the inbox asks you for it.
 5. **Nightly run:** `python -m portfolio_agent.cli nightly`. Schedule it with launchd. Each login is limited to 2 logins per night.
+6. **Institutions without daily access: upload statements.**
+   - Add a login with access method **Upload statements** and cadence **Monthly**. It needs no URL or password; Refresh and the nightly run skip it.
+   - Each month, press **Upload** on the login and pick the PDFs: one per account, or one consolidated statement.
+   - Each file is read like a portal page. Its accounts are checked and stored, or held in the Inbox. A statement is dated by the closing date of its period.
+   - Uploading the same statement again is safe: it's ignored once it has been read correctly, and read again if it wasn't.
+   - A monthly account turns **stale** 45 days after its last statement.
+   - Rockefeller and Schwab statements have built-in layout notes (`statement_guides.py`). For another institution, add notes to the login's playbook.
+   - Planned (spec Stage 13): these statements are picked up from email automatically, and upload becomes a fallback.
 
 **Test data:** the fictional samples in `data/samples/` stay for testing. Statements ingested with `cli ingest` aren't tied to any account, so the dashboard never shows them. To keep them out of your real database entirely, use `--db /tmp/test.db`.
 
