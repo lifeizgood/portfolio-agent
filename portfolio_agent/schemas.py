@@ -42,6 +42,24 @@ class Holding(BaseModel):
         return date.fromisoformat(s[:10])
 
 
+_OPTION_ROW = re.compile(r"^\s*(CALL|PUT)\b|\(100 SHS\)", re.I)
+
+
+def _fill_value(h):
+    """A row the model gave no value: worth quantity x price (x 100 shares per option
+    contract) when both are shown. A row with no value, quantity or price is dropped;
+    if it mattered, the holdings no longer add up to the stated total (V2)."""
+    if not isinstance(h, dict) or h.get("value") not in (None, "", "null"):
+        return h
+    q, p = h.get("quantity"), h.get("price")
+    try:
+        q, p = float(q), float(p)
+    except (TypeError, ValueError):
+        return None
+    per = 100 if _OPTION_ROW.search(str(h.get("description") or "")) else 1
+    return {**h, "value": round(q * p * per, 2)}
+
+
 def _as_of_aliases(data):
     # Callers and the extractor may send "as_of_date" / "as_of" instead.
     if isinstance(data, dict) and "as_of_datetime" not in data:
@@ -104,7 +122,9 @@ class AccountRows(BaseModel):
     @field_validator("holdings", mode="before")
     @classmethod
     def _none_is_empty(cls, v):
-        return [] if v is None else v       # caught by the non-empty check, then retried
+        if v is None:
+            return []                        # caught by the non-empty check, then retried
+        return [h for h in (_fill_value(h) for h in v) if h is not None]
 
     @field_validator("account_suffix", mode="before")
     @classmethod

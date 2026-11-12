@@ -90,13 +90,14 @@ async function loadChart() {
   if ($("#start").value) q.set("start", $("#start").value);
   if ($("#end").value) q.set("end", $("#end").value);
   if ($("#known-on").value) q.set("known_on", $("#known-on").value);
-  q.set("granularity", $("#granularity").value); q.set("group", $("#group").value);
+  const group = $("#group").value;      // "none": the total line only
+  q.set("granularity", $("#granularity").value); q.set("group", group === "none" ? "institution" : group);
   q.set("basis", basis);
   const d = await api("/api/series?" + q);
   $("#chart-empty").hidden = d.dates.length > 0;
   const sets = [{ label: "Total", data: d.total, borderColor: getComputedStyle(document.body).color,
     borderWidth: 2.5, pointRadius: 0, tension: 0.15, spanGaps: false }];
-  Object.entries(d.series).forEach(([name, vals], i) => sets.push({
+  if (group !== "none") Object.entries(d.series).forEach(([name, vals], i) => sets.push({
     label: name, data: vals, borderColor: palette[i % palette.length], borderWidth: 1.5,
     pointRadius: d.dates.length < 40 ? 2 : 0, tension: 0.15, carried: d.carried[name] || [] }));
   if (chart) chart.destroy();
@@ -498,13 +499,13 @@ async function uploadStatements(lg, btn, files) {
         headers: { "X-PA-Client": "1", "Content-Type": "application/pdf", "X-Filename": encodeURIComponent(f.name) } });
       const up = await res.json().catch(() => ({}));
       if (!res.ok) { notes.push(`${f.name}: ${up.detail || res.statusText}`); continue; }
-      if (up.duplicate && ["stored", "held", "mixed"].includes(up.outcome)) {
-        notes.push(`${f.name} was already uploaded on ${when(up.uploaded_at)} and read (${up.outcome}); skipped.`);
+      if (up.already_read) {
+        notes.push(`${f.name}: already read from ${up.filename === f.name ? "an upload" : esc(up.filename)} on ${when(up.uploaded_at)}; ignored.`);
         continue;
       }
       ids.push(up.id);
     }
-    if (!ids.length) { setLoginMsg(lg.id, notes.join(" ") || "Nothing to read.", true); btn.disabled = false; return; }
+    if (!ids.length) { setLoginMsg(lg.id, notes.join(" ") || "Nothing to read."); btn.disabled = false; return; }
     const { run_id } = await api(`/api/logins/${lg.id}/statements/read`, { method: "POST", body: { upload_ids: ids } });
     syncRefreshButtons();
     while (true) {
@@ -535,7 +536,7 @@ async function loadStatements(lg) {
   for (const u of ups) {
     const tr = document.createElement("tr");
     tr.innerHTML = `<td class="wrap">${esc(u.filename)}</td><td>${when(u.uploaded_at)}</td>
-      <td class="wrap">${u.outcome ? `<span class="pill ${u.outcome === "stored" ? "ok" : u.outcome === "held" || u.outcome === "mixed" ? "pending" : "needs_review"}">${esc(u.outcome)}</span> ` : `<span class="muted">not read yet</span>`}
+      <td class="wrap">${u.outcome ? `<span class="pill ${u.outcome === "stored" || u.outcome === "unchanged" ? "ok" : u.outcome === "held" || u.outcome === "mixed" ? "pending" : "needs_review"}">${esc(u.outcome)}</span> ` : `<span class="muted">not read yet</span>`}
         ${esc((u.detail || "").replace(u.filename + ": ", ""))}</td>
       <td><a href="/api/statements/${u.id}/file" target="_blank" rel="noopener">Open</a></td>`;
     tb.appendChild(tr);

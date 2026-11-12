@@ -166,6 +166,7 @@ _MIGRATIONS = {
     "runs": {"pid": "INTEGER", "login_ids": "TEXT",     # logins the run covers (JSON list)
              "trigger": "TEXT",                         # dashboard | login | nightly
              "cancel_requested": "INTEGER NOT NULL DEFAULT 0"},
+    "statement_uploads": {"text_sha256": "TEXT"},   # same statement, downloaded again
     "holdings": {"price_as_of": "TEXT"},   # a holding's own as-of date, when it has one       # process doing the run, to spot orphaned runs
 }
 
@@ -262,6 +263,25 @@ def write_snapshot(conn, snap: Snapshot, evidence: str | None = None,
     )
     conn.commit()
     return sid
+
+
+def same_statement_stored(conn, snap: Snapshot) -> int | None:
+    """An earlier statement already stored exactly these values for this account and
+    date (the same statement read again): its snapshot id, else None."""
+    if snap.account_id is None:
+        return None
+    mine = sorted((h.symbol or "", h.description, round(h.value, 2)) for h in snap.holdings)
+    for r in conn.execute("SELECT id, total FROM snapshots WHERE account_id=? AND as_of_date=?"
+                          " AND source='statement' ORDER BY id DESC",
+                          (snap.account_id, snap.as_of_date.isoformat())):
+        if abs(r["total"] - snap.total) > 0.005:
+            continue
+        theirs = sorted((h["symbol"] or "", h["description"], round(h["value"], 2)) for h in
+                        conn.execute("SELECT symbol, description, value FROM holdings"
+                                     " WHERE snapshot_id=?", (r["id"],)))
+        if theirs == mine:
+            return r["id"]
+    return None
 
 
 def _key_args(snap: Snapshot) -> tuple[str, tuple]:
@@ -574,10 +594,11 @@ def save_steps(conn, institution: str, steps: dict) -> None:
 
 # --- uploaded statements -----------------------------------------------------
 
-def add_upload(conn, login_id: int, filename: str, path: str, sha256: str, size: int) -> int:
+def add_upload(conn, login_id: int, filename: str, path: str, sha256: str, size: int,
+               text_sha256: str | None = None) -> int:
     cur = conn.execute("INSERT INTO statement_uploads (login_id, filename, path, sha256, size,"
-                       " uploaded_at) VALUES (?,?,?,?,?,?)",
-                       (login_id, filename, path, sha256, size, now_iso()))
+                       " uploaded_at, text_sha256) VALUES (?,?,?,?,?,?,?)",
+                       (login_id, filename, path, sha256, size, now_iso(), text_sha256))
     conn.commit()
     return cur.lastrowid
 
@@ -587,10 +608,12 @@ def get_upload(conn, upload_id: int) -> dict | None:
     return dict(r) if r else None
 
 
-def find_upload(conn, login_id: int, sha256: str) -> dict | None:
-    r = conn.execute("SELECT * FROM statement_uploads WHERE login_id=? AND sha256=?"
-                     " ORDER BY id LIMIT 1", (login_id, sha256)).fetchone()
-    return dict(r) if r else None
+def find_uploads(conn, login_id: int, sha256: str, text_sha256: str | None = None) -> list[dict]:
+    """Earlier uploads of the same file, or of a file with the same text (the same
+    statement downloaded again), oldest first."""
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM statement_uploads WHERE login_id=? AND (sha256=? OR text_sha256=?)"
+        " ORDER BY id", (login_id, sha256, text_sha256 or "-"))]
 
 
 def list_uploads(conn, login_id: int) -> list[dict]:

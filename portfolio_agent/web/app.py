@@ -487,7 +487,7 @@ def _open_item(c, iid: int) -> dict:
 def _upload_view(up: dict) -> dict:
     """An upload as the UI shows it; the file's location stays on the server."""
     return {k: up.get(k) for k in ("id", "filename", "size", "uploaded_at", "run_id",
-                                   "outcome", "detail", "duplicate")}
+                                   "outcome", "detail", "duplicate", "already_read")}
 
 
 def _expire_stuck_runs(c) -> None:

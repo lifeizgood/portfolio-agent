@@ -14,6 +14,7 @@ captured (`text`, plus `evidence`, the folder View Source shows). The order is
 fixed in code; the LLM only does the extraction step.
 """
 
+import re
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -48,6 +49,46 @@ class IngestState(TypedDict, total=False):
     details: list[dict]       # account details pages: [{label, suffix}], number read by code
 
 
+_OPTION_DESC = re.compile(r"^\s*(CALL|PUT)\b", re.I)
+_OPTION_SYMBOL = re.compile(r"^[A-Z.]{1,6}\d{6}[CP]\d+(\.\d+)?$")
+SHARES_PER_CONTRACT = 100
+
+
+def is_option(h) -> bool:
+    return bool(_OPTION_DESC.match(h.description or "")
+                or _OPTION_SYMBOL.match((h.symbol or "").replace(" ", "").upper()))
+
+
+def value_sold_options(ext: Extraction) -> Extraction:
+    """A sold (written) option is owed: its value is -(contracts x 100 x price per share),
+    whatever sign the statement prints for it. Computed here, not left to the model.
+    Its account's holdings still have to add up to the stated total (V2)."""
+    accounts = []
+    for rows in ext.accounts:
+        holdings = []
+        for h in rows.holdings:
+            if is_option(h) and h.quantity is not None and h.quantity < 0 and h.price:
+                price = abs(h.price)
+                h = h.model_copy(update={
+                    "price": price,
+                    "value": round(-abs(h.quantity) * SHARES_PER_CONTRACT * price, 2)})
+            holdings.append(h)
+        accounts.append(rows.model_copy(update={"holdings": holdings}))
+    return ext.model_copy(update={"accounts": accounts})
+
+
+def apply_statement_number(ext: Extraction, text: str, institution: str | None) -> Extraction:
+    """A one-account statement prints its account number: code reads the last 4, not
+    the model. Only when the statement shows exactly one number and the model found
+    exactly one account in it."""
+    from .statement_guides import guide_for, statement_number
+    number = statement_number(text, guide_for(institution))
+    if not number or len(ext.accounts) != 1:
+        return ext
+    rows = ext.accounts[0].model_copy(update={"account_suffix": number})
+    return ext.model_copy(update={"accounts": [rows]})
+
+
 def apply_detail_numbers(ext: Extraction, details: list[dict]) -> Extraction:
     """An account's number comes from its own details page, read by code, not from
     the model: the account whose name is the link that was clicked gets that page's
@@ -69,16 +110,19 @@ def apply_detail_numbers(ext: Extraction, details: list[dict]) -> Extraction:
 
 def _snapshot(ext: Extraction, rows, institution: str, source: str,
               liability: bool = False) -> Snapshot:
-    """A liability (loan, card) is owed, so its values are stored negative."""
-    sign = -1 if liability else 1
-    holdings = [h.model_copy(update={"value": sign * abs(h.value),
-                                     "price": None if liability else h.price,
-                                     "quantity": None if liability else h.quantity})
+    """A liability (loan, card) is owed, so its values are stored negative. An asset
+    account keeps each value's own sign: a sold option or margin cash is negative."""
+    if not liability:
+        return Snapshot(institution=institution, account=rows.account,
+                        as_of_datetime=ext.as_of_datetime,
+                        statement_total=rows.statement_total,
+                        holdings=list(rows.holdings), source=source)
+    holdings = [h.model_copy(update={"value": -abs(h.value), "price": None, "quantity": None})
                 for h in rows.holdings]
     total = rows.statement_total
     return Snapshot(institution=institution, account=rows.account,
                     as_of_datetime=ext.as_of_datetime,
-                    statement_total=None if total is None else sign * abs(total),
+                    statement_total=None if total is None else -abs(total),
                     holdings=holdings, source=source)
 
 
@@ -141,6 +185,9 @@ def build_ingest_graph(model, conn, today=None):
         except ExtractionError as e:
             return {"extraction": None, "errors": [str(e)], "attempts": attempts}
         ext = apply_detail_numbers(ext, state.get("details") or [])
+        if state.get("source") == "statement":
+            ext = apply_statement_number(ext, state["text"], inst)
+        ext = value_sold_options(ext)
         if ext.as_of_datetime is None and state.get("source") == "statement":
             # A statement is dated by its period; the upload time would misdate it.
             return {"extraction": None, "attempts": attempts, "errors": [
@@ -190,7 +237,10 @@ def build_ingest_graph(model, conn, today=None):
         login = state.get("login")
         inst = login["institution"] if login else (ext.institution or state.get("institution") or "")
         results = []
-        if login:   # an account whose number was misread before keeps its entry
+        # An account whose number was misread before keeps its entry. Only for portal
+        # pages, which list all of a login's accounts at once: a statement covers one
+        # account, so another account of the same name is simply not in it.
+        if login and state.get("source") != "statement":
             registry.relink_accounts(conn, login, [r for r in ext.accounts if not r.closed
                                                    and not registry.skip_reason(login, r)])
         for rows in ext.accounts:
@@ -243,6 +293,11 @@ def build_ingest_graph(model, conn, today=None):
                              "retrieved_at": state["retrieved_at"]})
                 results.append({"account": snap.account, "account_id": snap.account_id,
                                  "outcome": "held", "review_id": rid, "holds": holds})
+            elif (state.get("source") == "statement"
+                  and (same := store.same_statement_stored(conn, snap))):
+                # The same statement read again: these values are already stored.
+                results.append({"account": snap.account, "account_id": snap.account_id,
+                                "outcome": "unchanged", "snapshot_id": same})
             else:
                 sid = store.write_snapshot(conn, snap, evidence=state["evidence"],
                                            retrieved_at=state["retrieved_at"],

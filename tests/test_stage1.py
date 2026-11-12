@@ -1290,3 +1290,172 @@ def test_statement_reading_uses_the_institution_guide(tmp_path, monkeypatch):
     assert ROCKEFELLER.notes in seen[0]
     steps = json.loads(c.execute("SELECT trace FROM run_items").fetchone()[0])
     assert steps[1]["guide"] == "rockefeller" and steps[1]["read"] <= steps[1]["chars"] + 80
+
+
+def test_sold_option_value_is_minus_contracts_times_100_times_price():
+    from portfolio_agent.ingest_graph import value_sold_options
+    from portfolio_agent.schemas import Extraction
+    ext = Extraction.model_validate({"as_of": "2026-10-31", "accounts": [{
+        "account": "Alex Sample - Individual", "statement_total": 9900.0, "holdings": [
+            {"symbol": "XYZ", "description": "EXAMPLE CORP", "quantity": 100, "price": 100.0,
+             "value": 10000.0},
+            # printed as a positive $100 on the statement: still owed, so -100
+            {"symbol": "XYZ261218C110", "description": "CALL (XYZ) EXAMPLE CORP DEC 18 26 $110",
+             "quantity": -1, "price": 1.0, "value": 100.0},
+            # a bought option is left as the statement shows it
+            {"symbol": None, "description": "PUT (XYZ) EXAMPLE CORP DEC 18 26 $90",
+             "quantity": 2, "price": 0.5, "value": 100.0}]}]})
+    h = value_sold_options(ext).accounts[0].holdings
+    assert [x.value for x in h] == [10000.0, -100.0, 100.0]
+    assert h[1].price == 1.0
+    from portfolio_agent.validator import validate
+    s = snap(holdings=[x.model_dump() for x in h[:2]], statement_total=9900.0)
+    assert validate(s, today=date(2026, 11, 12)).ok
+
+
+
+def test_sold_option_keeps_its_minus_sign_through_a_whole_read(tmp_path, monkeypatch):
+    """The statement prints a sold call as +$310; it is owed, so it is stored as -310.
+    A row the model left without a value is worth quantity x price."""
+    from portfolio_agent.statements import read_uploads, save_upload
+    monkeypatch.setattr(config, "STATEMENTS_DIR", tmp_path / "statements")
+    reply = {"as_of": "2026-10-31", "accounts": [{
+        "account": "Alex Sample - Roth IRA", "account_suffix": "1234",
+        "statement_total": 9690.0, "holdings": [
+            {"description": "Cash", "value": 500.0},
+            {"symbol": "XYZ", "description": "EXAMPLE CORP", "quantity": 100, "price": 95.0,
+             "value": None},
+            {"symbol": "XYZ261218C55", "description": "CALL (XYZ) EXAMPLE CORP DEC 18 26 $55 (100 SHS)",
+             "quantity": -1, "price": 3.10, "value": 310.0},
+            {"description": "Footnote marker", "value": None}]}]}
+    c = store.connect(":memory:")
+    lid = add_login(c, name="RCM", institution="Rockefeller Digital", access_method="upload",
+                    login_url=None, allowed_domains=None)
+    lg = registry.get_login(c, lid)
+    up = save_upload(c, lg, "s.pdf", STATEMENT_PDF)
+    run = store.start_run(c, "upload")
+    read_uploads(c, run, lg, [up["id"]],
+                 lambda: FakeListChatModel(responses=[json.dumps(reply)] * 3))
+    outcome, detail = c.execute("SELECT outcome, detail FROM run_items").fetchone()
+    assert outcome in ("stored", "held"), detail
+    item = c.execute("SELECT payload FROM review_queue WHERE kind='held_value'").fetchone()
+    if item:
+        held = json.loads(item[0])["snapshot"]["holdings"]
+    else:
+        held = [dict(r) for r in c.execute("SELECT * FROM holdings")]
+    values = sorted(h["value"] for h in held)
+    assert values == [-310.0, 500.0, 9500.0]
+
+
+# --- duplicate statements ------------------------------------------------------------
+
+def _read(c, lid, up_id):
+    run_id = c.post(f"/api/logins/{lid}/statements/read", headers=H,
+                    json={"upload_ids": [up_id]}).json()["run_id"]
+    return c.get(f"/api/runs/{run_id}").json()["items"][0]
+
+
+def test_duplicate_statements_are_ignored_only_once_ingested(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "STATEMENTS_DIR", tmp_path / "statements")
+    good = json.dumps(STATEMENT)
+    # 1st read: misread twice -> review. 2nd read: fine. 3rd read (redownload): same values.
+    c = upload_client(tmp_path, ["not json", "not json", good, good])
+    lid = c.post("/api/logins", headers=H, json={
+        "name": "Example Wealth", "institution": "Example Wealth",
+        "access_method": "upload"}).json()["id"]
+    up = post_pdf(c, lid, STATEMENT_PDF).json()
+    assert _read(c, lid, up["id"])["outcome"] == "review"
+    # Not ingested: the same file uploaded again is read again.
+    again = post_pdf(c, lid, STATEMENT_PDF).json()
+    assert again["duplicate"] and not again["already_read"] and again["id"] == up["id"]
+    assert _read(c, lid, again["id"])["outcome"] == "held"
+    for i in c.get("/api/inbox").json():
+        if i["kind"] == "held_value":
+            c.post(f"/api/inbox/{i['id']}/approve", headers=H)
+    # Ingested: the same file, or a fresh download of it (other bytes, same text), is ignored.
+    third = post_pdf(c, lid, STATEMENT_PDF).json()
+    assert third["already_read"] is True
+    redownload = post_pdf(c, lid, STATEMENT_PDF + b"\n% downloaded again\n", "copy.pdf").json()
+    assert redownload["already_read"] is True and redownload["id"] == up["id"]
+    assert len(list((tmp_path / "statements" / f"login-{lid}").iterdir())) == 1
+    # Asked to read it anyway: skipped, nothing stored twice.
+    assert _read(c, lid, up["id"])["outcome"] == "skipped"
+    db = store.connect(c.db)
+    assert db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 2
+
+
+def test_rejected_misread_makes_a_duplicate_count_again(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "STATEMENTS_DIR", tmp_path / "statements")
+    good = json.dumps(STATEMENT)
+    c = upload_client(tmp_path, [good, good])
+    lid = c.post("/api/logins", headers=H, json={
+        "name": "Example Wealth", "institution": "Example Wealth",
+        "access_method": "upload"}).json()["id"]
+    up = post_pdf(c, lid, STATEMENT_PDF).json()
+    _read(c, lid, up["id"])
+    db = store.connect(c.db)
+    for i in c.get("/api/inbox").json():          # pretend both were known accounts, misread
+        db.execute("UPDATE review_queue SET payload=json_set(payload, '$.new_account', json('false'))"
+                   " WHERE id=?", (i["id"],))
+        db.commit()
+        c.post(f"/api/inbox/{i['id']}/reject", headers=H)
+    again = post_pdf(c, lid, STATEMENT_PDF).json()
+    assert again["already_read"] is False         # read again
+    assert _read(c, lid, again["id"])["outcome"] == "held"
+
+
+def test_same_statement_values_are_not_stored_twice(conn):
+    lid = upload_login(conn)
+    aid = active_account(conn, lid, name="Alex Trust", suffix="1234")
+    s = snap(account_id=aid, as_of="2026-10-31", source="statement")
+    store.write_snapshot(conn, s)
+    assert store.same_statement_stored(conn, s)
+    assert not store.same_statement_stored(conn, snap(account_id=aid, as_of="2026-09-30",
+                                                      source="statement"))
+    changed = snap(account_id=aid, as_of="2026-10-31", source="statement",
+                   holdings=[{"description": "Cash", "value": 15000.0}])
+    assert not store.same_statement_stored(conn, changed)
+
+
+# --- one-account statements: numbers read by code, never relinked ---------------------
+
+def _rcm_pdf(number: str, total: str) -> bytes:
+    return make_pdf(["STATEMENT FOR THE PERIOD OCTOBER 1, 2026 TO OCTOBER 31, 2026",
+                     "ALEX SAMPLE - Individual TOD", f"Account Number: {number}",
+                     f"ENDING VALUE (AS OF 10/31/26) {total}", "Holdings",
+                     f"TOTAL PORTFOLIO VALUE {total}"])
+
+
+def _rcm_reply(suffix: str, total: float) -> str:
+    return json.dumps({"as_of": "2026-10-31", "accounts": [{
+        "account": "ALEX SAMPLE - Individual TOD", "account_suffix": suffix,
+        "statement_total": total, "holdings": [{"description": "Cash", "value": total}]}]})
+
+
+def test_statement_number_is_read_by_code():
+    from portfolio_agent.statement_guides import ROCKEFELLER, SCHWAB, statement_number
+    assert statement_number(FAKE_RCM, ROCKEFELLER) == "1234"
+    assert statement_number(FAKE_RCM + "\nAccount Number: AAA-001234", ROCKEFELLER) == "1234"
+    # a statement showing two different numbers: code doesn't guess
+    assert statement_number(FAKE_RCM + "\nAccount Number: AAA-005678", ROCKEFELLER) is None
+    assert statement_number("Account Number 1234-5678 Statement Period", SCHWAB) == "5678"
+    assert statement_number(FAKE_RCM, None) is None
+
+
+def test_statements_of_same_named_accounts_stay_separate(tmp_path, monkeypatch):
+    """Two accounts with the same name, in two statements. The model misreads both
+    numbers the same way; code reads the real ones, and the second statement never
+    takes over the first account."""
+    from portfolio_agent.statements import read_uploads, save_upload
+    monkeypatch.setattr(config, "STATEMENTS_DIR", tmp_path / "statements")
+    c = store.connect(":memory:")
+    lid = add_login(c, name="RCM", institution="Rockefeller Digital", access_method="upload",
+                    login_url=None, allowed_domains=None)
+    lg = registry.get_login(c, lid)
+    for number, total in (("AAA-001111", 1000.0), ("AAA-002222", 2000.0)):
+        up = save_upload(c, lg, f"{number}.pdf", _rcm_pdf(number, f"${total:,.2f}"))
+        run = store.start_run(c, "upload")
+        read_uploads(c, run, lg, [up["id"]],
+                     lambda: FakeListChatModel(responses=[_rcm_reply("0001", total)] * 3))
+    accts = [a for a in registry.list_accounts(c) if a["login_id"] == lid]
+    assert sorted(a["portal_suffix"] for a in accts) == ["1111", "2222"]

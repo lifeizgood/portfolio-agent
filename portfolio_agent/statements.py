@@ -11,6 +11,7 @@ Debug tab and can be cancelled between files.
 """
 
 import hashlib
+import json
 import os
 import re
 from pathlib import Path
@@ -25,6 +26,43 @@ from .timeutil import now, now_iso
 
 class UploadError(ValueError):
     pass
+
+
+# An upload read with one of these outcomes was ingested (see `ingested`).
+READ_OK = {"stored", "held", "mixed", "unchanged"}
+
+
+def ingested(conn, up: dict) -> bool:
+    """Was this upload read correctly? Then the same statement uploaded again is ignored.
+    Not ingested: never read, or it ended in review, stopped or failed, or you rejected a
+    value from it in the Inbox as misread. Such a duplicate is read again. (Excluding a
+    new account is your decision about the account, not a misread: that still counts.)"""
+    if up["outcome"] not in READ_OK:
+        return False
+    for r in conn.execute("SELECT payload FROM review_queue WHERE kind='held_value'"
+                          " AND status='rejected' AND evidence=?", (up["path"],)):
+        payload = json.loads(r["payload"] or "{}")
+        # only the latest reading counts: a file re-read after a misread starts afresh
+        if payload.get("run_id") == up["run_id"] and not payload.get("new_account"):
+            return False
+    return True
+
+
+def _earlier(conn, login_id: int, sha: str, text_sha: str | None) -> dict | None:
+    """The earlier copy of this statement that counts: an ingested one if any."""
+    found = store.find_uploads(conn, login_id, sha, text_sha)
+    return next((u for u in found if ingested(conn, u)), found[0] if found else None)
+
+
+def _text_hash(path: Path) -> str | None:
+    """Hash of the statement's text, so a fresh download of the same statement (a
+    different file, same contents) is recognized too."""
+    try:
+        text = read_text(path, 10**8)
+    except Exception:
+        return None
+    norm = re.sub(r"\s+", " ", text).strip()
+    return hashlib.sha256(norm.encode()).hexdigest() if len(norm) > 50 else None
 
 
 def _safe_name(filename: str) -> str:
@@ -52,18 +90,23 @@ def save_upload(conn, login: dict, filename: str, data: bytes) -> dict:
     if not data.startswith(b"%PDF-"):
         raise UploadError(f"{Path(filename or '').name or 'The file'} isn't a PDF.")
     digest = hashlib.sha256(data).hexdigest()
-    seen = store.find_upload(conn, login["id"], digest)
-    if seen:
-        return {**seen, "duplicate": True}
+    seen = _earlier(conn, login["id"], digest, None)
+    if seen and seen["sha256"] == digest:   # the very same file: nothing new to keep
+        return {**seen, "duplicate": True, "already_read": ingested(conn, seen)}
     folder = config.STATEMENTS_DIR / f"login-{login['id']}"
     _private_dir(folder)
     target = folder / f"{now():%Y%m%dT%H%M%S}-{digest[:8]}-{_safe_name(filename)}"
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
+    text_digest = _text_hash(target)
+    same = _earlier(conn, login["id"], "-", text_digest) if text_digest else None
+    if same and ingested(conn, same):    # same statement, downloaded again: ignore it
+        target.unlink()
+        return {**same, "duplicate": True, "already_read": True}
     uid = store.add_upload(conn, login["id"], Path(filename or target.name).name[:200],
-                           str(target), digest, len(data))
-    return {**store.get_upload(conn, uid), "duplicate": False}
+                           str(target), digest, len(data), text_digest)
+    return {**store.get_upload(conn, uid), "duplicate": False, "already_read": False}
 
 
 def read_uploads(conn, run_id: int, login: dict, upload_ids: list[int],
@@ -78,6 +121,12 @@ def read_uploads(conn, run_id: int, login: dict, upload_ids: list[int],
             break
         up = store.get_upload(conn, uid)
         item = store.start_run_item(conn, run_id, login["id"])
+        if ingested(conn, up):            # already ingested: ignored, never stored twice
+            store.finish_run_item(conn, item, "skipped",
+                                  f"{up['filename']}: already read ({up['outcome']}); ignored.",
+                                  [], up["path"])
+            counts["skipped"] = counts.get("skipped", 0) + 1
+            continue
         trace = [{"action": "read_statement", "file": up["filename"], "at": now_iso()}]
         outcome, detail = "error", ""
         try:

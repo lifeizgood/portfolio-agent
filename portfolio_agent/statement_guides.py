@@ -21,12 +21,14 @@ class Guide:
     notes: str
     keep_through: str | None = None    # regex: text after the LAST match is cut
     cut_from: str | None = None        # else regex: text from the first match on is cut
+    account_number: str | None = None  # regex, group 1: the statement's one account number
 
 
 ROCKEFELLER = Guide(
     keywords=("rockefeller", "rcm"),
     keep_through=r"^TOTAL PORTFOLIO VALUE\b.*$",
     cut_from=r"^Footnotes and Cost Basis Information",    # an account with no positions
+    account_number=r"Account Number:?\s*([A-Z0-9]{2,4}-?\d{4,})",
     notes="""Rockefeller Capital Management statement (accounts carried by National Financial Services):
 - ONE account per statement. Its name is the line right under "STATEMENT FOR THE PERIOD ...",
   shaped "<OWNER NAME> - <registration>", e.g. "ALEX SAMPLE - Individual TOD" or
@@ -44,9 +46,12 @@ ROCKEFELLER = Guide(
   "Total" are subtotals, not holdings.
 - Cash: "BANK DEPOSIT SWEEP PROGRAM" and "Cash" / "NET CASH POSITION" rows are holdings
   (description "Cash" or the sweep name). Net cash can be negative (money borrowed on margin).
-- Amounts in parentheses are negative. Options written (sold): the quantity in parentheses is
-  negative and so is the market value; keep both negative. An option's price is per share and
-  one contract is 100 shares. symbol = the option symbol line under it (e.g. ABC260116C50).
+- Amounts in parentheses are negative.
+- Options: one contract is 100 shares and the price is per share. A SOLD (written) option
+  shows its quantity in parentheses, e.g. (1): give quantity as a negative number (-1) and price
+  as the positive per-share price. Its value is negative: -(contracts x 100 x price), e.g.
+  -(1 x 100 x $1.00) = -100, whatever sign the market value column shows.
+  symbol = the option symbol line under it (e.g. ABC260116C50).
 - An account with no positions ("There were no positions in your account ...") is still
   returned, with holdings [] and statement_total = its ENDING VALUE (usually 0).
 - A LOAN: when TOTAL PORTFOLIO VALUE is negative and the only holding is negative cash / NET
@@ -58,6 +63,7 @@ ROCKEFELLER = Guide(
 SCHWAB = Guide(
     keywords=("schwab",),
     cut_from=r"^Transactions - Summary",
+    account_number=r"Account Number:?\s*(\d{4}-\d{4})\b",
     notes="""Charles Schwab statement:
 - ONE account per statement. Account name: the "Account Nickname" if one is shown, else the
   account title near the top (e.g. "Schwab One Account of ALEX SAMPLE").
@@ -75,6 +81,10 @@ SCHWAB = Guide(
   pending/unsettled cash, interest rate, % of account. value = the ending balance (the
   second amount); description "Cash".
 - Ignore "⁺" marks and stray commas after descriptions. Amounts in parentheses are negative.
+- Options: one contract is 100 shares and the price is per share. A SOLD (written) option
+  shows its quantity in parentheses, e.g. (1): give quantity as a negative number (-1) and price
+  as the positive per-share price. Its value is negative: -(contracts x 100 x price), e.g.
+  -(1 x 100 x $1.00) = -100, whatever sign the market value column shows.
 - Transactions, pending transactions and endnotes are not holdings.""")
 
 GUIDES = (ROCKEFELLER, SCHWAB)
@@ -101,3 +111,13 @@ def trim(text: str, guide: Guide | None) -> str:
     if end is None:
         return text
     return text[:end].rstrip() + "\n[... activity, footnotes and disclosures left out ...]"
+
+
+def statement_number(text: str, guide: Guide | None) -> str | None:
+    """Last 4 of the account number a one-account statement shows, read by code. None
+    unless exactly one distinct number is found (a consolidated statement shows several)."""
+    if not guide or not guide.account_number:
+        return None
+    found = {re.sub(r"[^A-Z0-9]", "", m.group(1).upper())
+             for m in re.finditer(guide.account_number, text, re.I)}
+    return next(iter(found))[-4:] if len(found) == 1 else None
