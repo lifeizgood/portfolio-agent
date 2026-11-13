@@ -1459,3 +1459,95 @@ def test_statements_of_same_named_accounts_stay_separate(tmp_path, monkeypatch):
                      lambda: FakeListChatModel(responses=[_rcm_reply("0001", total)] * 3))
     accts = [a for a in registry.list_accounts(c) if a["login_id"] == lid]
     assert sorted(a["portal_suffix"] for a in accts) == ["1111", "2222"]
+
+
+# --- Sign in with Google ----------------------------------------------------------------
+
+def test_google_sign_in_never_types_and_stops_when_google_asks():
+    from portfolio_agent.browser.portal import GOOGLE_BUTTON, google_step, is_google
+    assert is_google("https://accounts.google.com/v3/signin/identifier")
+    assert not is_google("https://accounts.google.com.evil.example/x")
+    assert not is_google("https://example.com/?next=accounts.google.com")
+    assert GOOGLE_BUTTON.search("Sign in with Google") and GOOGLE_BUTTON.search("Continue with Google")
+    assert not GOOGLE_BUTTON.search("Sign in")
+    # account chooser: one account, or the saved username among several
+    assert google_step("Choose an account", ["alex@example.com"], None, False) == (
+        "choose", "alex@example.com")
+    assert google_step("Choose an account", ["a@example.com", "Alex@example.com"],
+                       "alex@example.com", False) == ("choose", "Alex@example.com")
+    assert google_step("Choose an account", ["a@example.com", "b@example.com"], None,
+                       False)[0] == "stop"
+    # anything that would need typing, Google refusing the browser, or a consent screen
+    assert google_step("Enter your password", [], None, True)[0] == "stop"
+    assert "may not be secure" in google_step(
+        "Couldn't sign you in. This browser or app may not be secure.", [], None, False)[1]
+    assert google_step("Example Wealth wants to access your Google Account", [], None,
+                       False)[0] == "stop"
+    assert google_step("One moment please", [], None, False) == ("wait", "")
+
+
+def test_login_can_sign_in_with_google(conn):
+    lid = add_login(conn, sign_in_with="google")
+    assert registry.get_login(conn, lid)["sign_in_with"] == "google"
+    assert registry.get_login(conn, add_login(conn, name="Other"))["sign_in_with"] == "password"
+    with pytest.raises(ValueError):
+        registry.LoginIn(name="x", institution="x", sign_in_with="facebook")
+
+
+def test_frec_statement_reads_first_page_total_priced_portfolio():
+    from portfolio_agent.statement_guides import guide_for, trim
+    g = guide_for("Frec")
+    assert g.keywords[0] == "frec" and "TOTAL PRICED PORTFOLIO" in g.notes
+    text = ("[page 1]\nFrec Securities Statement October 1 - October 31, 2026\n"
+            "Alex Sample Individual Account ...1234\n"
+            "Opening Balance Closing Balance\nTOTAL PRICED PORTFOLIO $9,000.00 $9,500.00\n\n"
+            "[page 2]\nPositions\nEXAMPLE CORP 10 $50.00 $500.00\n\n[page 3]\nDisclosures")
+    cut = trim(text, g)
+    assert "TOTAL PRICED PORTFOLIO" in cut and "Positions" not in cut and "Disclosures" not in cut
+    assert trim("no page markers here", g) == "no page markers here"
+
+
+# --- accepting a page whose extra number isn't an account --------------------------------
+
+def test_accept_accounts_read_when_the_extra_number_is_not_an_account(conn):
+    from portfolio_agent.ingest_graph import accept_review, build_ingest_graph
+    lid = add_login(conn, name="Example CU", institution="Example CU",
+                    login_url="https://www.example-cu.test", allowed_domains=None)
+    lg = registry.get_login(conn, lid)
+    page = "Member number\n...9999\nShare Savings\n...1234\n$5.00\nChecking\n...5678\n$100.00\n"
+    reply = json.dumps({"as_of": "2026-11-10T16:00:00", "accounts": [
+        {"account": "Share Savings", "account_suffix": "1234", "statement_total": 5.0,
+         "holdings": [{"description": "Balance", "value": 5.0}]},
+        {"account": "Checking", "account_suffix": "5678", "statement_total": 100.0,
+         "holdings": [{"description": "Balance", "value": 100.0}]}]})
+    model = FakeListChatModel(responses=[reply] * 2)
+    out = build_ingest_graph(model, conn).invoke({
+        "text": page, "evidence": "/tmp/evidence", "login": lg, "source": "portal",
+        "retrieved_at": "2026-11-10T16:05:00+00:00"})
+    assert out["outcome"] == "review"
+    item = store.open_review_items(conn)[0]
+    assert "ending 9999" in item["reason"]
+
+    res = accept_review(conn, item["id"])
+    assert res["not_accounts"] == ["9999"]
+    assert res["outcome"] in ("held", "stored", "mixed")
+    assert len(res["results"]) == 2 and all(r["account_id"] for r in res["results"])
+    assert store.get_inbox_item(conn, item["id"])["status"] == "approved"
+    # next time the member number is no reason to reject the page
+    lg = registry.get_login(conn, lid)
+    model = FakeListChatModel(responses=[reply])
+    again = build_ingest_graph(model, conn).invoke({
+        "text": page, "evidence": "/tmp/evidence", "login": lg, "source": "portal",
+        "retrieved_at": "2026-11-10T16:05:00+00:00"})
+    assert again["outcome"] != "review"
+
+
+def test_only_a_missing_number_can_be_accepted(conn):
+    from portfolio_agent.ingest_graph import accept_review, unlisted_numbers
+    assert unlisted_numbers("The page lists an account ending 9999 that wasn't extracted. "
+                            "Extract every account shown.") == ["9999"]
+    assert unlisted_numbers("Holdings don't add up to the total.") is None
+    rid = store.add_review_item(conn, reason="Holdings don't add up to the total.",
+                                payload={"extraction": {"accounts": []}}, login_id=1)
+    with pytest.raises(ValueError):
+        accept_review(conn, rid)

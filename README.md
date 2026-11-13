@@ -34,11 +34,13 @@ python -m portfolio_agent.cli serve      # dashboard at http://127.0.0.1:8765
 3. **Sign in by hand once** so the portal remembers this device:
    `python -m portfolio_agent.cli open-browser <login id>`
    This uses the same browser profile the fetcher uses, stored in `data/private/browser/`.
+   - **Sites where you sign in with Google** (e.g. Frec): set **Sign in with** to **Google** on the login, then do this step with Google. Later runs press the site's "Sign in with Google" button and pick your account in Google's chooser; the fetcher never types into Google's pages. When Google wants your password or a verification step again, the run stops and the Inbox asks you to repeat this step. If several Google accounts are signed in here, save the right one's email as the login's username.
 4. **Press Refresh.** The extractor reads every account on the page.
    - The accounts must add up to the page's total for all accounts; if one is missing, the reading is rejected.
    - Each new account appears under its login as **pending**, and its first value is held in the **Inbox**. Check it with **View Source** (screenshot, page text, page HTML), then approve it.
    - Rename an account, change its type, or set it to **ignored** under Accounts & logins.
    - If the portal asks for a verification code, the inbox asks you for it.
+   - If a page is rejected because it shows a number that isn't an account (e.g. a member number), press **Accept accounts read** on the Inbox item. The number is saved under the login's **Numbers that aren't accounts**, and the accounts read are checked again and held for your approval.
 5. **Nightly run:** `python -m portfolio_agent.cli nightly`. Schedule it with launchd. Each login is limited to 2 logins per night.
 6. **Institutions without daily access: upload statements.**
    - Add a login with access method **Upload statements** and cadence **Monthly**. It needs no URL or password; Refresh and the nightly run skip it.
@@ -46,7 +48,7 @@ python -m portfolio_agent.cli serve      # dashboard at http://127.0.0.1:8765
    - Each file is read like a portal page. Its accounts are checked and stored, or held in the Inbox. A statement is dated by the closing date of its period.
    - Uploading the same statement again is safe: it's ignored once it has been read correctly, and read again if it wasn't.
    - A monthly account turns **stale** 45 days after its last statement.
-   - Rockefeller and Schwab statements have built-in layout notes (`statement_guides.py`). For another institution, add notes to the login's playbook.
+   - Rockefeller, Schwab and Frec statements have built-in layout notes (`statement_guides.py`). Frec: only the first page is read, and the account's value is the closing balance of TOTAL PRICED PORTFOLIO (no individual positions). For another institution, add notes to the login's playbook.
    - Planned (spec Stage 13): these statements are picked up from email automatically, and upload becomes a fallback.
 
 **Test data:** the fictional samples in `data/samples/` stay for testing. Statements ingested with `cli ingest` aren't tied to any account, so the dashboard never shows them. To keep them out of your real database entirely, use `--db /tmp/test.db`.

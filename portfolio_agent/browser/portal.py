@@ -118,8 +118,9 @@ class _PageAdapter:
 class _Holder:
     """Current page plus the allowlist state shared with the route handler."""
 
-    def __init__(self, page, deadline, should_cancel=lambda: False):
+    def __init__(self, page, deadline, should_cancel=lambda: False, domains=None):
         self.page = page
+        self.nav_domains: list[str] = list(domains or [])   # where navigation may go now
         self.blocked_nav: str | None = None
         self.deadline = deadline
         self.should_cancel = should_cancel
@@ -179,11 +180,12 @@ def fetch_portal(login: dict, creds: dict | None, ctx: FetchContext) -> Evidence
         holder = None
         try:
             holder = _Holder(browser.pages[0] if browser.pages else browser.new_page(),
-                             time.monotonic() + config.FETCH_TIMEOUT_S, ctx.should_cancel)
+                             time.monotonic() + config.FETCH_TIMEOUT_S, ctx.should_cancel,
+                             domains)
 
             def guard_route(route, request):
-                if (request.is_navigation_request() and request.frame.parent_frame is None
-                        and not host_allowed(request.url, domains)):
+                if (request.is_navigation_request() and _top_level(request)
+                        and not host_allowed(request.url, holder.nav_domains)):
                     holder.blocked_nav = request.url
                     trace.add("blocked_navigation", url=request.url)
                     return route.abort()
@@ -192,12 +194,8 @@ def fetch_portal(login: dict, creds: dict | None, ctx: FetchContext) -> Evidence
             def watch_request(request):
                 # Playwright doesn't route redirects, so check every main-frame
                 # navigation request (including redirect hops) as it happens.
-                try:
-                    main = request.frame.parent_frame is None
-                except Exception:
-                    main = False
-                if (request.is_navigation_request() and main
-                        and not host_allowed(request.url, domains)):
+                if (request.is_navigation_request() and _top_level(request)
+                        and not host_allowed(request.url, holder.nav_domains)):
                     holder.blocked_nav = holder.blocked_nav or request.url
                     trace.add("blocked_navigation", url=request.url)
 
@@ -213,7 +211,7 @@ def fetch_portal(login: dict, creds: dict | None, ctx: FetchContext) -> Evidence
             for n, url in enumerate(saved, 1):
                 trace.add("goto_saved_holdings_url", url=url)
                 _PageAdapter(holder).goto(url)
-                state = _classify(holder.page, domains)
+                state = _state(holder.page, login, domains)
                 if state == "login":   # session expired between pages: log in once more
                     _login(holder, login, creds, steps, ctx)
                     _PageAdapter(holder).goto(url)
@@ -251,6 +249,15 @@ def fetch_portal(login: dict, creds: dict | None, ctx: FetchContext) -> Evidence
             raise
         finally:
             browser.close()
+
+
+def _top_level(request) -> bool:
+    """Is this navigation for a whole page? A new window's (popup's) first navigation
+    has no frame yet: it is a whole page too, so it is checked like one."""
+    try:
+        return request.frame.parent_frame is None
+    except Exception:
+        return True
 
 
 def _frames(page, domains: list[str] | None):
@@ -354,6 +361,8 @@ def _classify(page, domains: list[str] | None = None) -> str:
 
 def _login(holder: _Holder, login: dict, creds: dict | None, steps: dict,
            ctx: FetchContext) -> None:
+    if login.get("sign_in_with") == "google":
+        return _google_login(holder, login, creds, ctx)
     page, trace = holder.page, ctx.trace
     domains = registry.domains(login)
     if page.url in ("", "about:blank") or not host_allowed(page.url, domains):
@@ -386,6 +395,9 @@ def _login(holder: _Holder, login: dict, creds: dict | None, steps: dict,
             _check_login_cap(ctx, login)
             store.record_login(ctx.conn, login["id"], ctx.run_kind)
             counted = True
+        if not host_allowed(page.url, domains):   # never type a password on another site
+            raise FetchStopped("login_failed", "The sign-in form isn't on this login's own "
+                               "site, so nothing was typed into it.")
         pw_sel = steps.get("password_selector") or "input[type=password]"
         scope = _login_scope(page, domains, steps)
         if scope is not page:
@@ -430,6 +442,194 @@ def _login(holder: _Holder, login: dict, creds: dict | None, steps: dict,
                                "signing in. Check the saved username and password. Not retrying, "
                                "to avoid a lockout.")
     raise FetchStopped("unexpected", "Login didn't finish after several pages.")
+
+
+# --- Sign in with Google ------------------------------------------------------------
+# The fetcher never types into Google's pages: no password, no code. The owner signs in
+# by hand once (open-browser) and the profile keeps the Google session. On each run the
+# fetcher only presses the portal's "Sign in with Google" button and picks the account
+# in Google's chooser. Anything else Google asks for stops the run with a question.
+
+GOOGLE_DOMAINS = ["accounts.google.com"]
+GOOGLE_BUTTON = re.compile(r"\b(sign in|log in|login|continue|sign up)\s+(with|using)\s+google\b", re.I)
+GOOGLE_INSECURE = re.compile(r"browser or app may not be secure|couldn.?t sign you in", re.I)
+GOOGLE_CONSENT = re.compile(r"wants (additional )?access|wants to access|\ballow\b.*\baccess\b"
+                            r"|to continue, google will share", re.I)
+
+
+def is_google(url: str) -> bool:
+    return host_allowed(url, GOOGLE_DOMAINS) and url.startswith("https://")
+
+
+def google_step(text: str, accounts: list[str], wanted: str | None,
+                has_input: bool) -> tuple[str, str]:
+    """What to do on a Google page: ("choose", account) to click an account in the
+    chooser, ("wait", "") while Google is only redirecting, or ("stop", why). Never
+    anything that types."""
+    if GOOGLE_INSECURE.search(text):
+        return "stop", ("Google refused to sign in from the fetcher's browser (\"This browser "
+                        "or app may not be secure\"). Google sign-in can't be used for this "
+                        "login; use a username and password if the site offers one, or upload "
+                        "statements instead.")
+    if GOOGLE_CONSENT.search(text):
+        return "stop", ("Google is asking you to grant access to the site. Only you can do "
+                        "that: sign in by hand once with open-browser.")
+    if accounts:
+        want = (wanted or "").strip().lower()
+        match = [a for a in accounts if a.lower() == want] if want else []
+        if match:
+            return "choose", match[0]
+        if len(accounts) == 1 and not want:
+            return "choose", accounts[0]
+        return "stop", ("Google's account chooser shows " + (
+            "several accounts" if not want else "no account matching the saved username")
+            + ". Save the Google account's email as this login's username, or sign in by "
+            "hand with open-browser.")
+    if has_input:
+        return "stop", ("Google wants your password or a verification step. The fetcher "
+                        "never types into Google's pages: sign in by hand once with "
+                        "open-browser.")
+    return "wait", ""
+
+
+def _google_scopes(page, domains):
+    """The page and its frames on the login's own site or Google's sign-in button frame."""
+    out = [page]
+    for f in page.frames:
+        try:
+            if f != page.main_frame and f.url and (host_allowed(f.url, domains) or is_google(f.url)):
+                out.append(f)
+        except Exception:
+            continue
+    return out
+
+
+def _google_button(page, domains):
+    """The portal's "Sign in with Google" button, if one is showing."""
+    if is_google(page.url):
+        return None
+    for scope in _google_scopes(page, domains):
+        for role in ("button", "link"):
+            try:
+                loc = scope.get_by_role(role, name=GOOGLE_BUTTON)
+                for i in range(min(loc.count(), 3)):
+                    if loc.nth(i).is_visible():
+                        return loc.nth(i)
+            except Exception:
+                continue
+        try:
+            loc = scope.get_by_text(GOOGLE_BUTTON)
+            if loc.count() and loc.first.is_visible():
+                return loc.first
+        except Exception:
+            pass
+    return None
+
+
+def _state(page, login: dict, domains) -> str:
+    """Page state; for a Google login, a page showing the Google button is a login page."""
+    state = _classify(page, domains)
+    if state == "ok" and login.get("sign_in_with") == "google" and (
+            is_google(page.url) or _google_button(page, domains) is not None):
+        return "login"
+    return state
+
+
+def _live_page(holder) -> object:
+    """The page to work on: Google's sign-in may open a popup and close it again."""
+    try:
+        if not holder.page.is_closed():
+            return holder.page
+        pages = [p for p in holder.page.context.pages if not p.is_closed()]
+        if pages:
+            holder.page = pages[-1]
+    except Exception:
+        pass
+    return holder.page
+
+
+def _sign_in_by_hand(login: dict, why: str) -> str:
+    return (f"{why} Run `.venv/bin/python -m portfolio_agent.cli open-browser {login['id']}`, "
+            "choose Sign in with Google and finish signing in, close the window, then "
+            "Refresh again.")
+
+
+def _google_login(holder: _Holder, login: dict, creds: dict | None, ctx: FetchContext) -> None:
+    trace = ctx.trace
+    domains = registry.domains(login)
+    page = _live_page(holder)
+    if page.url in ("", "about:blank") or not host_allowed(page.url, domains):
+        trace.add("goto_login", url=login["login_url"])
+        _PageAdapter(holder).goto(login["login_url"])
+    counted, widened = False, False
+    try:
+        for _ in range(8):
+            holder.check()
+            page = _live_page(holder)
+            _settle(page)
+            if is_google(page.url):
+                text = _body_text(page)[:5000]
+                tiles = page.locator("[data-identifier]")
+                accounts = []
+                for i in range(min(tiles.count(), 10)):
+                    try:
+                        if tiles.nth(i).is_visible():
+                            accounts.append(tiles.nth(i).get_attribute("data-identifier") or "")
+                    except Exception:
+                        continue
+                has_input = _visible(page.locator("input:not([type=hidden])"))
+                action, arg = google_step(text, [a for a in accounts if a],
+                                          (creds or {}).get("username"), has_input)
+                trace.add("google_page", step=action)       # never the account's email
+                if action == "stop":
+                    raise FetchStopped("google_sign_in", _sign_in_by_hand(login, arg))
+                if action == "choose":
+                    for i in range(min(tiles.count(), 10)):
+                        if tiles.nth(i).get_attribute("data-identifier") == arg:
+                            tiles.nth(i).click(timeout=15000)
+                            break
+                    trace.add("google_account_chosen")
+                else:
+                    page.wait_for_timeout(1500)
+                try:
+                    page.wait_for_url(lambda u: not is_google(u), timeout=30000)
+                except Exception:
+                    pass
+                continue
+            button = _google_button(page, domains)
+            if button is None:
+                state = _classify(page, domains)
+                trace.add("page_state", state=state, url=page.url)
+                if state == "ok":
+                    return
+                if state == "twofa":          # the portal's own code step, after Google
+                    _two_factor(holder, login, ctx)
+                    continue
+                if state in ("captcha", "security_question"):
+                    raise FetchStopped(state, _sign_in_by_hand(
+                        login, "The portal asked for a check only you can answer."))
+                raise FetchStopped("login_failed", "The sign-in page shows no \"Sign in with "
+                                   "Google\" button. If the button is labelled differently, "
+                                   "sign in by hand with open-browser and tell me its label.")
+            if not counted:
+                _check_login_cap(ctx, login)
+                store.record_login(ctx.conn, login["id"], ctx.run_kind)
+                counted = True
+            if not widened:   # Google's sign-in pages, for this step only
+                holder.nav_domains += GOOGLE_DOMAINS
+                widened = True
+            trace.add("google_button_clicked", url=page.url)
+            url = page.url
+            button.click(timeout=15000)
+            try:
+                page.wait_for_url(lambda u: u != url, timeout=15000)
+            except Exception:
+                pass
+        raise FetchStopped("google_sign_in", _sign_in_by_hand(
+            login, "Sign in with Google didn't finish after several pages."))
+    finally:
+        if widened:
+            holder.nav_domains = [d for d in holder.nav_domains if d not in GOOGLE_DOMAINS]
 
 
 LOGIN_MESSAGE = ("[role=alert], [aria-live=assertive], [aria-live=polite], .error, .alert,"
@@ -833,6 +1033,9 @@ def open_browser_for_manual_login(login: dict) -> None:
         page.goto(login["login_url"])
         print("Sign in in the browser window, choose 'remember this device' if offered,"
               " then close the window.")
+        if login.get("sign_in_with") == "google":
+            print("This login signs in with Google: press 'Sign in with Google' and finish"
+                  " signing in to Google here. Later runs reuse that Google session.")
         try:
             page.wait_for_event("close", timeout=0)
         except Exception:

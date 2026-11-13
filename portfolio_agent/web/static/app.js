@@ -54,14 +54,43 @@ function periodStart(p) {
   return d.toISOString().slice(0, 10);
 }
 
+// Chart settings are remembered in this browser, so a reload or another browser tab
+// shows the chart the way you left it. Default: the total line only, all dates.
+const CHART_KEY = "chartSettings";
+function saveChartSettings() {
+  const on = document.querySelector("#period button.on");
+  const f = { period: on ? on.dataset.p : null, start: $("#start").value, end: $("#end").value,
+    granularity: $("#granularity").value, group: $("#group").value, known_on: $("#known-on").value };
+  try { localStorage.setItem(CHART_KEY, JSON.stringify(f)); } catch {}
+}
+function restoreChartSettings() {
+  let f = null;
+  try { f = JSON.parse(localStorage.getItem(CHART_KEY) || "null"); } catch {}
+  f = f || {};
+  const pick = (sel, v) => { if (v && [...$(sel).options].some((o) => o.value === v)) $(sel).value = v; };
+  pick("#group", f.group || "none");
+  pick("#granularity", f.granularity);
+  $("#known-on").value = f.known_on || "";
+  if (f.period || !f.start) {         // a period button: dates relative to today
+    const p = f.period || "All";
+    document.querySelectorAll("#period button").forEach((b) => b.classList.toggle("on", b.dataset.p === p));
+    $("#start").value = periodStart(p); $("#end").value = "";
+  } else {                            // dates you picked
+    document.querySelectorAll("#period button").forEach((b) => b.classList.remove("on"));
+    $("#start").value = f.start; $("#end").value = f.end || "";
+  }
+}
+
 $("#period").addEventListener("click", (e) => {
   const p = e.target.dataset.p; if (!p) return;
   document.querySelectorAll("#period button").forEach((b) => b.classList.toggle("on", b === e.target));
   $("#start").value = periodStart(p); $("#end").value = "";
+  saveChartSettings();
   loadChart();
 });
 ["#start", "#end", "#granularity", "#group", "#known-on"].forEach((s) => $(s).addEventListener("change", () => {
   if (s === "#start" || s === "#end") document.querySelectorAll("#period button").forEach((b) => b.classList.remove("on"));
+  saveChartSettings();
   loadChart();
 }));
 
@@ -358,6 +387,9 @@ async function loadInbox() {
       actions = `<button class="primary" data-act="approve">Approve</button><button data-act="reject">Reject</button>`;
     else if (it.kind === "twofa_code")
       actions = `<input class="code" inputmode="numeric" autocomplete="one-time-code" placeholder="code"><button class="primary" data-act="answer">Submit code</button><button data-act="reject">Dismiss</button>`;
+    else if (it.kind === "review" && it.payload?.extraction && /^The page lists an account ending \w+ that wasn't extracted\./.test(it.reason || "")
+             && (it.reason || "").split("; ").every((r) => /^The page lists an account ending \w+ that wasn't extracted\./.test(r)))
+      actions = `<button class="primary" data-act="approve" title="The other numbers on the page (e.g. a member or card number) aren't accounts. They're remembered for this login, and the accounts read are checked again and stored or held.">Accept accounts read</button><button data-act="reject">Dismiss</button>`;
     else actions = `<button data-act="reject">Dismiss</button>`;
     if (it.evidence_files?.length) actions += `<button class="link" data-act="source">View Source</button>`;
     const change = it.kind === "playbook_proposal" ? `<pre>${esc(JSON.stringify(it.payload.change, null, 2))}</pre>` : "";
@@ -851,6 +883,7 @@ async function showRun(id) {
   box.scrollIntoView({ behavior: "smooth" });
 }
 
+restoreChartSettings();
 loadDashboard();
 setInterval(loadInboxBadge, 15000);
 

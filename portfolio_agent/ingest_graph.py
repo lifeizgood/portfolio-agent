@@ -163,8 +163,10 @@ def _closed_account(conn, login: dict | None, rows, ext: Extraction, state) -> d
 
 def build_ingest_graph(model, conn, today=None):
     def load(state: IngestState) -> IngestState:
-        text = state.get("text") or read_text(state["path"])
-        return {"text": text, "attempts": 0, "errors": [], "results": [],
+        accepted = state.get("extraction") is not None   # re-checking what was read before
+        text = state.get("text") if accepted else (state.get("text") or read_text(state["path"]))
+        return {"text": text or "", "attempts": MAX_ATTEMPTS if accepted else 0,
+                "errors": [], "results": [],
                 "evidence": state.get("evidence") or state.get("path"),
                 "retrieved_at": state.get("retrieved_at") or now_iso()}
 
@@ -203,7 +205,8 @@ def build_ingest_graph(model, conn, today=None):
         ext = Extraction.model_validate(state["extraction"])
         login = state.get("login")
         inst = login["institution"] if login else (ext.institution or state.get("institution") or "")
-        errors = validate_extraction(ext) + unlisted_accounts(state["text"], ext)
+        errors = validate_extraction(ext) + unlisted_accounts(
+            state["text"], ext, registry.last4s(login.get("not_accounts")) if login else ())
         if state.get("source") == "portal":   # V13: a live page's date is about now
             age = parse_iso(state["retrieved_at"]) - ext.as_of_datetime
             if age.days > config.PORTAL_MAX_AGE_DAYS:
@@ -320,7 +323,9 @@ def build_ingest_graph(model, conn, today=None):
             conn, reason="; ".join(state["errors"]),
             institution=login.get("institution") or state.get("institution"),
             account=login.get("name"), login_id=login.get("id"), evidence=state["evidence"],
-            payload={"extraction": state.get("extraction")} if state.get("extraction") else None)
+            payload={"extraction": state.get("extraction"), "source": state.get("source"),
+                     "retrieved_at": state.get("retrieved_at"), "run_id": state.get("run_id")}
+            if state.get("extraction") else None)
         return {"outcome": "review", "review_id": rid}
 
     g = StateGraph(IngestState)
@@ -330,12 +335,50 @@ def build_ingest_graph(model, conn, today=None):
     g.add_node("commit", commit)
     g.add_node("review", review)
     g.add_edge(START, "load")
-    g.add_edge("load", "extract")
+    g.add_conditional_edges("load", lambda s: "validate" if s.get("extraction") else "extract",
+                            ["validate", "extract"])
     g.add_edge("extract", "validate")
     g.add_conditional_edges("validate", route, ["commit", "extract", "review"])
     g.add_edge("commit", END)
     g.add_edge("review", END)
     return g.compile()
+
+
+_UNLISTED = re.compile(r"^The page lists an account ending (\w{1,4}) that wasn't extracted\.")
+
+
+def unlisted_numbers(reason: str) -> list[str] | None:
+    """The numbers a "Rejected twice" item says weren't extracted, if that was its only
+    problem; else None."""
+    parts = [p.strip() for p in (reason or "").split("; ") if p.strip()]
+    found = [_UNLISTED.match(p) for p in parts]
+    return [m.group(1) for m in found] if parts and all(found) else None
+
+
+def accept_review(conn, item_id: int) -> dict:
+    """The user accepts the accounts read on a page rejected only because it shows
+    numbers that weren't read as accounts. Those numbers are remembered as not being
+    accounts for this login, and the accounts read go through every other check again,
+    then are stored or held as usual."""
+    item = store.get_inbox_item(conn, item_id)
+    if not item or item["kind"] != "review" or item["status"] != "open":
+        raise ValueError("Not an open rejected item.")
+    p = item["payload"] or {}
+    numbers = unlisted_numbers(item["reason"])
+    if not p.get("extraction") or numbers is None or not item.get("login_id"):
+        raise ValueError("Only a page whose one problem is numbers that weren't read as "
+                         "accounts can be accepted; dismiss it instead.")
+    registry.add_not_accounts(conn, item["login_id"], numbers)
+    login = registry.get_login(conn, item["login_id"])
+    evidence = item["evidence"] or ""
+    source = p.get("source") or ("statement" if evidence.lower().endswith(".pdf") else "portal")
+    out = build_ingest_graph(None, conn).invoke({
+        "extraction": p["extraction"], "text": "", "evidence": evidence, "login": login,
+        "source": source, "run_id": p.get("run_id"),
+        "retrieved_at": p.get("retrieved_at") or item["created_at"]})
+    store.resolve_inbox_item(conn, item_id, "approved" if out["outcome"] != "review" else "rejected")
+    return {"outcome": out["outcome"], "not_accounts": registry.last4s(login.get("not_accounts")),
+            "results": out.get("results") or [], "errors": out.get("errors") or []}
 
 
 def approve_held(conn, item_id: int) -> int:

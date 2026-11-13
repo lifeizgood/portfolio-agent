@@ -160,7 +160,9 @@ _MIGRATIONS = {
     # Per-login rules: which listed accounts to skip, which are debts.
     "logins": {"skip_categories": "TEXT", "liability_categories": "TEXT",
                "skip_other_institutions": "INTEGER NOT NULL DEFAULT 0",
-               "open_account_details": "INTEGER NOT NULL DEFAULT 0"},
+               "open_account_details": "INTEGER NOT NULL DEFAULT 0",
+               "sign_in_with": "TEXT NOT NULL DEFAULT 'password'",   # password | google
+               "not_accounts": "TEXT"},    # last 4s the page shows that aren't accounts
     "run_items": {"login_id": "INTEGER", "evidence": "TEXT"},
     "login_attempts": {"login_id": "INTEGER"},
     "runs": {"pid": "INTEGER", "login_ids": "TEXT",     # logins the run covers (JSON list)

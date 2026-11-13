@@ -126,6 +126,8 @@
           <option value="email_statement">Email statement</option><option value="manual">Manual</option></select></label>
         <label>Login page URL<input name="login_url" type="url" placeholder="https://www.mymerrill.com"></label>
         <label>Allowed domains<input name="allowed_domains" placeholder="defaults to the login page's domain"></label>
+        <label>Sign in with<select name="sign_in_with">
+          <option value="password">Username and password</option><option value="google">Google (sign in by hand first)</option></select></label>
         <label>2FA method<select name="twofa_method">
           <option value="remembered_device">Remembered device</option><option value="sms">SMS</option>
           <option value="email">Email</option><option value="authenticator">Authenticator app</option></select></label>
@@ -136,6 +138,7 @@
       </div>
       <details open><summary>Account rules for this login</summary>
         <div class="grid">
+          <label>Numbers that aren't accounts<input name="not_accounts" placeholder="e.g. a member or card number's last 4: 1234"></label>
           <label>Skip these categories<input name="skip_categories" placeholder="e.g. Investments (already fetched by another login)"></label>
           <label>Debts: store as negative<input name="liability_categories" placeholder="e.g. Loans, Credit cards"></label>
           <label class="check"><input type="checkbox" name="skip_other_institutions"> Skip accounts the page shows as held at another institution (e.g. Merrill on a Bank of America page)</label>

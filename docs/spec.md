@@ -69,7 +69,7 @@ The dashboard is a local web app served only on localhost: a small **FastAPI bac
 - **Period selector.** Presets 1M / 3M / YTD / 1Y / 3Y / All, or a custom date range.
 - **Charts:**
   - trend lines;
-  - net worth over time, split by account, institution or type;
+  - net worth over time, as the total line only (the default) or split by account, institution or type. The chart's settings are remembered in the browser [U, 2026-11-12];
   - a "what changed" bridge: market moves, late or restated private values, cash flows, and unexplained moves;
   - returns shown both ways: **IRR** (money-weighted) and **time-weighted** [U D17].
 - **Daily dating rule.** Values are placed by `as_of_datetime`. For each day, each account uses its latest accepted value at or before the end of that day. A value carried forward is labeled with its as-of date [2.1].
@@ -124,7 +124,7 @@ Trend lines, charting and date selection are present from Stage 1.
 
 **Where each component first appears:**
 
-- **Stage 1:** portal fetcher, extractor, validator, store, registry/credential UI, dashboard, nightly run and Refresh. Added during Stage 1: **statement upload** for logins that can't be read daily, with per-institution statement guides (Rockefeller, Schwab) [U, 2026-11-12].
+- **Stage 1:** portal fetcher, extractor, validator, store, registry/credential UI, dashboard, nightly run and Refresh. Added during Stage 1: **statement upload** for logins that can't be read daily, with per-institution statement guides (Rockefeller, Schwab, Frec) [U, 2026-11-12].
 - **Stage 4:** capital-statement extraction, roll-forward schema and the roll-forward check (V7).
 - **Stage 7:** statement fetcher and the password email.
 - **Stage 11:** retrieval of investor letters and the trend explanations.
@@ -237,7 +237,7 @@ Fetching and extracting are separate because fetching acts on live sites and ext
 
 Every tool returns a structured result with its source. A failure (timeout, page not found, wrong PDF password) comes back as an observation, not a crash.
 
-*Today's code: a single ingest graph (`ingest_graph.py`) and a single ReAct Q&A agent (`react_graph.py`). There's no orchestrator, fetcher or Refresh path yet.*
+*Today's code: the orchestrator (`runner.py`: nightly run, Refresh, per-login Refresh, parallel runs that never share an institution's browser profile), the portal fetcher (`browser/portal.py`, with the LLM fallback navigator in `browser/navigator.py`), the extractor and validator inside the ingest graph (`ingest_graph.py`), statement upload (`statements.py`), and the ReAct Q&A agent (`react_graph.py`, not yet in the dashboard). The Auth tool has the encrypted credential store (`crypto.py`) and the SMS code reader (`sms.py`); there's no email code reader, statement fetcher, analyst or manual-input path yet.*
 
 ---
 
@@ -266,7 +266,7 @@ Every tool returns a structured result with its source. A failure (timeout, page
 | Statement upload | login, file name, private path, file hash, text hash, uploaded at, last run, last outcome. One row per distinct file; an upload is **ingested** when its last read stored or held its values and none was rejected as a misread [U, 2026-11-12] |
 | Holding | symbol (if public), description, quantity, price, value, `price_as_of` (the holding's own date when the portal shows one, e.g. "Last Updated 06/30/2026" for a private fund; may be older than the page, never later) [U] |
 
-*Today's code (`schemas.py`, `store.py`) has both entities with append-only bitemporal reads, but stores `as_of` as a date only. No source type.*
+*Today's code (`schemas.py`, `store.py`): both entities, with `as_of_datetime`, `retrieved_at`, source type (portal, statement, …), evidence and statement total; append-only bitemporal reads. Debt signs and part-owned shares are applied only when values are read. No roll-forward or cash-flow tables yet.*
 
 ### 5.2 Capital-account roll-forward [U D5, D6]
 
@@ -318,6 +318,7 @@ The user maintains the registry through the UI; agents only read it [U D1].
   - **Skip categories,** e.g. `Investments` on Bank of America, whose Merrill accounts are already fetched by the Merrill login.
   - **Skip accounts held at another institution:** an account the page labels as held elsewhere, e.g. a Merrill loan on a Bank of America page.
   - **Debt categories,** e.g. `Loans`. These accounts are stored as **negative** values because the money is owed, and they reduce net worth.
+  - **Numbers that aren't accounts,** e.g. a credit union member number shown on the page. They don't count as accounts the extraction missed (V12).
   - Each account's debt flag can be changed on Accounts & logins. An account a skip rule matches is marked excluded.
 
 | Field | Records | Used by |
@@ -325,7 +326,7 @@ The user maintains the registry through the UI; agents only read it [U D1].
 | Display name | e.g. "Schwab joint brokerage" | Dashboard, summary, Q&A |
 | Institution, account type | Brokerage / retirement / wealth management / private fund | Grouping; cadence |
 | Access method | Browser, API, email statement, **upload** or manual. Upload: the user uploads monthly PDF statements in the dashboard, for institutions whose portal can't be read daily; nightly runs and Refresh skip these logins. Chosen by the user; the system doesn't decide [U D1, 2026-11-12] | Orchestrator |
-| Login mechanism | Portal URL, credential reference, and the login steps the user enters (Stage 1) [U] | Fetcher; browser allowlist |
+| Login mechanism | Portal URL, credential reference, and the login steps the user enters (Stage 1) [U]. **Sign in with:** username and password, or **Google** (the site's "Sign in with Google"; the user signs in to Google by hand once) [U, 2026-11-12] | Fetcher; browser allowlist |
 | 2FA method | SMS, email or authenticator app. The Auth tool tries email or SMS first, and asks the user when it can't get the code [U C12] | Auth tool |
 | Statement sender | Full email address of the statement sender | Mail filter |
 | PDF password source | Sender of the password email, or a password the user stores [U D8] | Statement fetcher |
@@ -336,7 +337,7 @@ The user maintains the registry through the UI; agents only read it [U D1].
 - **Every edit is checked in code:** the credential exists, the portal domain is added to the allowlist, and the sender is a full email address [2.1].
 - **Agents can suggest, not change.** A new sender or portal address becomes an inbox suggestion. Only the user approves registry changes [2.1, 6.1].
 
-*Not implemented.*
+*Today's code (`registry.py`, Accounts & logins in the dashboard): logins with URL, domains, 2FA method, cadence (nightly, monthly), access method (browser or upload in use), holds-public-securities and encrypted credentials; accounts with display name, type, category, status (pending, active, excluded, ignored, closed), debt flag and owner; login rules. Not yet: statement sender, PDF password source, quarterly cadence, and registry suggestions from agents.*
 
 ### 5.5 Credentials [U C9, D8]
 
@@ -384,7 +385,7 @@ Secrets never appear in messages.
 | Playbook proposal | The proposed change, with the run that prompted it [U D14] |
 | Registry suggestion | New sender or portal address [2.1, 6.1] |
 
-*Today's `review_queue` table has reason, evidence, payload and status. There are no kinds and no cause tag.*
+*Today's `review_queue` has kinds: review (rejected twice), held value, question, 2FA code, playbook proposal, registry suggestion and alert. There's no cause tag and no password request yet.*
 
 ### 5.9 Retrieval index [3.1]
 
@@ -430,7 +431,7 @@ Retrieval is for **text only**: why a value changed, what a statement says, how 
 
 Retrieved text is data, never instructions.
 
-*Not implemented. Playbooks exist today as plain text keyed by institution (`store.get_playbook`).*
+*Not implemented (Stage 11). Playbooks exist as plain text keyed by institution (`store.get_playbook`), and statement layout notes live in `statement_guides.py`.*
 
 ---
 
@@ -445,13 +446,13 @@ The validator is deterministic code with no LLM. A snapshot is accepted only if 
 | V3 | **Quantity × price** | qty × price ≈ value for each holding, using the portal's own numbers. For an option, qty × price × 100 (one contract is 100 shares). **No market-feed check** [U C3] | ✅ 2% tolerance; options × 100 |
 | V4 | **Non-negative values** | A negative holding in an asset account is a likely sign misread, except a **sold option** or **margin cash**, allowed when the account has a stated total for V2 to check against. A sold option's value is set in code to −(contracts × 100 × price), whatever sign the statement prints [U, 2026-11-12] | ✅ |
 | V5 | **As-of not in the future** | | ✅ |
-| ~~V6~~ | ~~As-of not earlier than the last accepted value~~ | **Removed.** Out-of-order ingestion is valid [U C4] | ❌ still enforced; must be removed |
+| ~~V6~~ | ~~As-of not earlier than the last accepted value~~ | **Removed.** Out-of-order ingestion is valid [U C4] | ✅ removed |
 | V7 | **Roll-forward** | Each capital statement reconciles within itself, and with the previous period (§5.2) [6.1, U D5] | ❌ not implemented; no roll-forward schema |
-| V8 | **Continuity** | The change from the **nearest earlier accepted value** is explainable [U D19]; a large unexplained move is flagged or held [2.1, 6.1]. Market data looked up by ticker may serve as the benchmark [U C14]. Outcome (C6) and threshold and benchmark (D3) are open | ⚠️ hard error above 25% (`PA_LARGE_MOVE`); market move is an optional input |
-| V9 | **Traceability** | Each value has stored, viewable evidence, as required by View Source [4.1, U C5] | ⚠️ evidence path is stored; not checked |
+| V8 | **Continuity** | The change from the **nearest earlier accepted value** is explainable [U D19]; a large unexplained move is flagged or held [2.1, 6.1]. Market data looked up by ticker may serve as the benchmark [U C14]. Outcome (C6) and threshold and benchmark (D3) are open | ⚠️ a move above 25% (`PA_LARGE_MOVE`) is held for approval, not rejected; market move is an optional input; the benchmark (D3) is still open |
+| V9 | **Traceability** | Each value has stored, viewable evidence, as required by View Source [4.1, U C5] | ⚠️ evidence is stored with every value and shown by View Source; not checked as a rule |
 | V11 | **Overall total covered** | When a page shows an overall total, the accounts extracted add up to at least that total. They may add up to more: some accounts sit outside the portal's overall value and are still kept [U] | ✅ `validate_extraction` |
 | V13 | **Live page is current** | For a portal page, the as-of is within 5 days of when the page was captured (`PA_PORTAL_MAX_AGE_DAYS`). The extractor is told the capture date, and a page with no date uses the capture time (D16) [U] | ✅ `ingest_graph.check` |
-| V12 | **Every listed account extracted** | Every account number listed on the page (on its own line, e.g. `12A-34567` or `...1234`) matches an extracted account's last 4 characters [U] | ✅ `unlisted_accounts` |
+| V12 | **Every listed account extracted** | Every account number listed on the page (on its own line, e.g. `12A-34567` or `...1234`) matches an extracted account's last 4 characters [U]. Numbers the user marks as not accounts (a member or card number) are left out; a page rejected only for such numbers can be accepted from the Inbox, which saves them for the login [U, 2026-11-12] | ✅ `unlisted_accounts`, `accept_review` |
 | V10 | **Manual input** (Stage 10) | User-entered values pass the same checks as other values for that account type. View Source shows who entered the value, when, and an optional attachment [U D23] | ❌ |
 
 The continuity threshold and the step budget are to be tuned from test runs [2.1].
@@ -469,7 +470,7 @@ The continuity threshold and the step budget are to be tuned from test runs [2.1
 
 The docs' "retry by another route" (e.g. the PDF instead of the web page) is parked with C2.
 
-*Today's code does steps 1–2 (`MAX_ATTEMPTS = 2`). There's no `fix` command and no correction indexing (README next step 2).*
+*Today's code does steps 1–2 (`MAX_ATTEMPTS = 2`; the second rejection becomes a "Rejected twice" Inbox item). Held values are approved or rejected in the Inbox, but there's no fix-and-save correction and no correction indexing yet.*
 
 ---
 
@@ -495,6 +496,7 @@ The docs' "retry by another route" (e.g. the PDF instead of the web page) is par
 
 - Every tool is read-only.
 - The browser is restricted to registry portal domains and may **submit only the login form**.
+- Passwords are typed only on the login's own domains. **Sign in with Google:** `accounts.google.com` is allowed only during sign-in. There the fetcher may only pick an account in Google's chooser; it never types into Google's pages or grants access, and anything else Google asks for stops the run with an Inbox question [U, 2026-11-12].
 - Clicks on controls labeled **transfer, trade, withdraw, order, delete, settings** are blocked in code.
 - Credentials are filled from the encrypted store by the Auth tool and never pass through the model.
 - **No network egress of extracted data**: no aggregators. Outbound lookups may carry ticker symbols only, never quantities, values or account details [U C13, C14].
@@ -687,6 +689,9 @@ The owner's ruling on each item from the first version of this spec.
 | S5 | Account numbers on statements | Read by code from the statement; a statement never moves an existing account to another number. | Resolved; built |
 | S6 | Misfiled values | Delete them outright rather than mark them withdrawn (one-off, with a backup). | Resolved; done |
 | S7 | Email for brokerage statements | Add Stage 13: brokerage statements arrive by email and are read automatically; manual upload becomes a fallback. | Planned |
+| S8 | Sign in with Google (Frec) | Supported as a login mechanism; the fetcher never types a Google password. The owner signs in to Google by hand; runs reuse that session. | Resolved; built, not yet tried on the real site |
+| S9 | Frec statements | Read the first page only; the value on the closing date is the Closing Balance of TOTAL PRICED PORTFOLIO, stored as one holding (no positions). | Resolved; built, not yet tried on a real statement |
+| S10 | Extra numbers on a page | A page rejected only because it shows numbers that aren't accounts (e.g. a member number) can be accepted in the Inbox; the numbers are saved as "not accounts" for the login. | Resolved; built |
 
 ---
 
@@ -697,7 +702,7 @@ The owner's ruling on each item from the first version of this spec.
 | # | Contradiction | Sources |
 |---|---|---|
 | C5 | **Escalation band vs review-by-design.** The target is 5–15% of values sent to review. But every first value, every run after a playbook change, and every private-fund value in supervised mode goes to review by design, so early rates will sit far above the band. Do those count toward the band? | 6.1 |
-| C6 | **What happens to a big unexplained jump.** 2.1 says flag it but accept it; 6.1 says hold it until approved; the code treats it as an extraction error. Treating it as an error means a real big move is re-extracted (which can't help, since the reading was right) and then reported as "failed twice". | 2.1, 6.1 vs `validator.py` |
+| C6 | **What happens to a big unexplained jump.** 2.1 says flag it but accept it; 6.1 says hold it until approved. The code now holds it for approval (the 6.1 option) instead of treating it as an extraction error; confirm that's the ruling. | 2.1, 6.1 |
 | C16 | **No synthetic data vs testing and the demo.** With the synthetic milestones dropped, there's no labeled set to measure field accuracy, abstain/answer calibration or prompt-injection resistance before a change reaches real accounts. 5.1 and 6.1 also say the demo uses synthetic data only. Options: keep a small synthetic set for tests and the demo only, while rollout uses real portals; or measure accuracy from View Source spot checks and corrections, and test injection on hand-made samples. | U D21 vs 5.1, 6.1 |
 
 ### 14.2 Open decisions
@@ -719,21 +724,25 @@ The owner's ruling on each item from the first version of this spec.
 
 | Area | Status in `portfolio_agent/` |
 |---|---|
-| Bitemporal, append-only store; review queue; playbooks | ⚠️ `store.py`: as-of is a date only, not a timestamp; no source type; review queue has no item kinds |
-| Snapshot / Holding schema | ⚠️ `schemas.py`: no `as_of_datetime`, roll-forward table, cash flows, cause tags or registry |
-| Validator V1–V5 | ✅ `validator.py` (V3 already uses the statement's own numbers) |
-| Validator V6 | ❌ still enforced; remove (U C4) |
+| Bitemporal, append-only store; review queue; playbooks | ✅ `store.py`: `as_of_datetime`, retrieval time, source type, Inbox item kinds, playbooks and playbook proposals |
+| Snapshot / Holding schema | ✅ `schemas.py`, with `price_as_of`. ❌ roll-forward table, cash flows, cause tags |
+| Validator V1–V5, V11–V13 | ✅ `validator.py`, `ingest_graph.check` (V3 options × 100; V4 allows sold options and margin cash) |
+| Validator V6 | ✅ removed (U C4) |
 | Validator V7 (roll-forward), V9 (traceability) | ❌ / ⚠️ |
-| Validator V8 (continuity) | ⚠️ hard error rather than a hold (C6) |
+| Validator V8 (continuity) | ⚠️ held for approval above 25%; benchmark open (D3) |
 | Extract → validate → retry once → review | ✅ `ingest_graph.py` (retry semantics deferred) |
 | Capital-statement extraction (NAV, excluding unfunded commitment) | ✅ `extractor.py`; no roll-forward fields |
-| ReAct Q&A with read-only tools | ✅ `react_graph.py`, `tools.py`. Needs a 30 s limit instead of `STEP_BUDGET = 8`. Not needed until Stage 12. |
-| Orchestrator, fetchers, Refresh, statement fetcher, Auth tool | ❌ |
+| ReAct Q&A with read-only tools | ✅ `react_graph.py`, `tools.py`, not yet in the dashboard. Needs a 30 s limit instead of `STEP_BUDGET = 8`. Not needed until Stage 12. |
+| Orchestrator, nightly run, Refresh | ✅ `runner.py`, `cli.py`; parallel runs, cancel, run trace in the Debug tab |
+| Portal fetcher | ✅ `browser/portal.py`: persistent profile per institution, playbook steps, LLM fallback navigator, account numbers from details pages |
+| Auth tool | ⚠️ encrypted credentials (`crypto.py`, key file `~/.portfolio-agent/secret.key`) and SMS codes (`sms.py`); 2FA code request in the Inbox. ❌ email code reader |
 | Statement upload (upload logins, guides, duplicate check, sold options) | ✅ `statements.py`, `statement_guides.py`, `ingest_graph.py` (Stage 1 addition) |
-| Brokerage statements by email | ❌ (Stage 13) |
-| Registry UI, encrypted credentials | ❌ |
-| Dashboard (FastAPI + web front end), charts, IRR / time-weighted returns, View Source, inbox, recommendations file | ❌ |
-| Completeness / stale check | ❌ |
+| Statement fetcher (email, Stages 7 and 13) | ❌ |
+| Sign in with Google | ✅ `browser/portal.py` (`_google_login`); tried on fake pages only |
+| Registry UI, encrypted credentials | ✅ Accounts & logins: logins, accounts, include/exclude, login rules, debt flags, owners and part-owned shares. ❌ statement sender, PDF password source |
+| Dashboard | ✅ FastAPI + web front end (`web/`): net worth, charts (daily/monthly, split by account/institution/type/none, "as known on"), Accounts table with filters, View Source, Inbox, Debug. ❌ IRR / time-weighted returns, recommendations file |
+| Completeness / stale check | ✅ `series.account_status` (nightly and monthly cadences) |
 | Retrieval index, corrections, citations, cross-check | ❌ (Stage 11) |
-| Guardrails: allowlist, blocked clicks, login caps, kill switch | ❌ (no browser yet) |
+| Guardrails: allowlist, blocked clicks, login caps, kill switch | ✅ `browser/guard.py` (allowlist, blocked clicks), `PA_MAX_LOGINS` per night, `data/private/STOP` kill switch |
+| Manual inputs (Stage 10) | ❌ |
 | Metrics harness | ❌ (`tests/test_core.py` covers the core with a fake model and fictional samples; see C16) |

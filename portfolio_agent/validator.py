@@ -122,10 +122,11 @@ _ACCOUNT_LINE = re.compile(
     r"^\s*(?:[A-Z0-9]{3}-[A-Z0-9]{5}|(?:\.{3}|…|[xX*]{3,}[- ]?)[A-Z0-9]{4})\s*$", re.M)
 
 
-def unlisted_accounts(text: str, ext: Extraction) -> list[str]:
+def unlisted_accounts(text: str, ext: Extraction, not_accounts=()) -> list[str]:
     """Account numbers on the page whose last 4 characters match no extracted account.
-    Deterministic, so a skipped account is caught even when it sits outside every total."""
-    have = {(a.account_suffix or "")[-4:] for a in ext.accounts}
+    Deterministic, so a skipped account is caught even when it sits outside every total.
+    Numbers the user said aren't accounts (a card, a routing number) are left out."""
+    have = {(a.account_suffix or "")[-4:] for a in ext.accounts} | set(not_accounts)
     missing = []
     for m in _ACCOUNT_LINE.finditer(text or ""):
         last4 = re.sub(r"[^A-Z0-9]", "", m.group(0).upper())[-4:]

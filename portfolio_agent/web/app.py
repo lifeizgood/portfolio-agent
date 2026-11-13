@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import config, registry, series, store
-from ..ingest_graph import approve_held
+from ..ingest_graph import accept_review, approve_held
 from ..runner import run_logins, select_logins
 from ..timeutil import now, parse_iso
 
@@ -180,6 +180,11 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
         item = _open_item(c, iid)
         if item["kind"] == "held_value":
             return {"snapshot_id": approve_held(c, iid)}
+        if item["kind"] == "review":
+            try:
+                return accept_review(c, iid)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
         if item["kind"] == "playbook_proposal":
             p = item["payload"]
             steps = registry.steps_for(c, p["institution"])

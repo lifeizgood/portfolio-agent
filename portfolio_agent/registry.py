@@ -20,6 +20,7 @@ from .timeutil import now_iso
 ACCOUNT_TYPES = {"brokerage", "retirement", "wealth_management", "private_fund", "bank", "loan",
                  "credit_card", "other"}
 ACCESS_METHODS = {"browser", "upload", "api", "email_statement", "manual"}   # upload: you upload statements
+SIGN_IN_METHODS = {"password", "google"}   # google: the portal's "Sign in with Google"
 TWOFA_METHODS = {"remembered_device", "sms", "email", "authenticator"}
 CADENCES = {"nightly", "monthly", "quarterly"}
 LOGIN_STATUSES = {"active", "closed"}
@@ -48,6 +49,7 @@ class LoginIn(BaseModel):
     login_url: str | None = None
     allowed_domains: str | None = None   # comma-separated; defaults from login_url
     twofa_method: str = "remembered_device"
+    sign_in_with: str = "password"
     cadence: str = "nightly"
     holds_public: bool = True
     status: str = "active"
@@ -56,6 +58,7 @@ class LoginIn(BaseModel):
     skip_categories: str | None = None          # e.g. "Investments" (shown by another login)
     liability_categories: str | None = "Loans, Credit cards, Mortgages, Lines of credit"
     skip_other_institutions: bool = False       # skip accounts the page shows as held elsewhere
+    not_accounts: str | None = None             # numbers on the page that aren't accounts (last 4s)
     open_account_details: bool = False          # open each account's page for its exact name/number
     # Login steps for the institution's playbook (all optional; blank = auto-detect)
     username_selector: str | None = None
@@ -80,6 +83,11 @@ class LoginIn(BaseModel):
     @classmethod
     def _c(cls, v):
         return _one_of(v, CADENCES)
+
+    @field_validator("sign_in_with")
+    @classmethod
+    def _sign_in(cls, v):
+        return _one_of(v or "password", SIGN_IN_METHODS)
 
     @field_validator("status")
     @classmethod
@@ -160,7 +168,7 @@ def check(login: LoginIn) -> list[str]:
 _LOGIN_COLS = ["name", "institution", "access_method", "login_url", "allowed_domains",
                "twofa_method", "cadence", "holds_public", "status", "closed_on",
                "skip_categories", "liability_categories", "skip_other_institutions",
-               "open_account_details"]
+               "open_account_details", "sign_in_with", "not_accounts"]
 _STEP_KEYS = ["username_selector", "password_selector", "submit_selector", "holdings_urls",
               "account_number_link"]
 
@@ -190,6 +198,27 @@ def save_login(conn, login: LoginIn, login_id: int | None = None) -> int:
     steps.update({k: data[k] for k in _STEP_KEYS})
     store.save_steps(conn, login.institution, steps)
     return login_id
+
+
+def last4s(text: str | None) -> list[str]:
+    """Last 4 characters of each comma-separated number, e.g. "9999, ...1234"."""
+    out = []
+    for part in (text or "").split(","):
+        chars = re.sub(r"[^A-Z0-9]", "", part.upper())[-4:]
+        if chars and chars not in out:
+            out.append(chars)
+    return out
+
+
+def add_not_accounts(conn, login_id: int, numbers: list[str]) -> list[str]:
+    """Remember that these numbers on the login's pages aren't accounts."""
+    lg = get_login(conn, login_id)
+    have = last4s(lg.get("not_accounts"))
+    new = have + [n for n in last4s(",".join(numbers)) if n not in have]
+    conn.execute("UPDATE logins SET not_accounts=?, updated_at=? WHERE id=?",
+                 (", ".join(new) or None, now_iso(), login_id))
+    conn.commit()
+    return new
 
 
 def steps_for(conn, institution: str) -> dict:

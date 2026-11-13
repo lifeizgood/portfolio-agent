@@ -22,6 +22,7 @@ class Guide:
     keep_through: str | None = None    # regex: text after the LAST match is cut
     cut_from: str | None = None        # else regex: text from the first match on is cut
     account_number: str | None = None  # regex, group 1: the statement's one account number
+    pages: int | None = None           # read only the first N pages (the rest is cut)
 
 
 ROCKEFELLER = Guide(
@@ -87,7 +88,20 @@ SCHWAB = Guide(
   -(1 x 100 x $1.00) = -100, whatever sign the market value column shows.
 - Transactions, pending transactions and endnotes are not holdings.""")
 
-GUIDES = (ROCKEFELLER, SCHWAB)
+FREC = Guide(
+    keywords=("frec",),
+    pages=1,
+    notes="""Frec statement (only its FIRST PAGE is given; the rest was cut on purpose):
+- ONE account per statement. Account name: the account title shown on the first page.
+  account_suffix = the last 4 characters of the account number, if the first page shows one.
+- as_of = the closing date of the statement period (the last day of the period).
+- The account's value is the CLOSING BALANCE on the "TOTAL PRICED PORTFOLIO" line. If that
+  line shows an opening and a closing balance, use the closing one, never the opening one.
+- Return exactly ONE holding: description "Total priced portfolio", value = that closing
+  balance, quantity null, price null. Don't list individual positions.
+- statement_total = the same closing balance. grand_total = null.""")
+
+GUIDES = (ROCKEFELLER, SCHWAB, FREC)
 
 
 def guide_for(institution: str | None) -> Guide | None:
@@ -100,7 +114,12 @@ def guide_for(institution: str | None) -> Guide | None:
 
 
 def trim(text: str, guide: Guide | None) -> str:
-    """Cut what follows the holdings, when the guide says where they end."""
+    """Cut what follows the holdings, when the guide says where they end, and every
+    page after the first N when the guide reads only those."""
+    if guide and guide.pages:
+        m = re.search(rf"^\[page {guide.pages + 1}\]$", text, re.M)
+        if m:
+            text = text[:m.start()].rstrip() + "\n[... later pages left out ...]"
     end = None
     if guide and guide.keep_through:
         for m in re.finditer(guide.keep_through, text, re.M):
