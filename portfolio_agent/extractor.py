@@ -54,14 +54,53 @@ fund name, value = the ending balance, quantity and price null, and use the same
 number for its statement_total. Unfunded commitments are not part of the value."""
 
 
+STATEMENT_NOTE = """This document is a periodic account statement, not a live page.
+- "as_of" is the CLOSING date of the statement period (for "October 1 - October 31, 2026"
+  use 2026-10-31), not the date it was printed, mailed or downloaded.
+- For each account use its ENDING (closing) value and the holdings as of that date,
+  never the beginning-of-period value.
+- A consolidated statement covers several accounts, often with a summary page listing
+  each one and its value: return every account once, with the holdings from its own
+  section, and the summary's overall total as grand_total.
+- Activity, transactions, income, realized gain/loss and projected income sections are
+  history or estimates, not holdings.
+- If an account's total value includes accrued interest or dividends, list that amount
+  as its own holding so the holdings add up to the total."""
+
+
 class ExtractionError(Exception):
     pass
 
 
+CAPITAL_NOTE = """This document is a CAPITAL ACCOUNT STATEMENT for an investment in a
+private fund (a limited partnership or LLC interest), not a brokerage statement.
+- "as_of" is the END of the period the statement covers (e.g. "for the quarter ended
+  September 30, 2026" -> 2026-09-30), even though it was issued weeks or months later.
+  Never use the issue, letter or mailing date.
+- Each fund (or investor interest) in the document is one account. Its name: the fund's
+  name as shown (with the series or class if shown). account_suffix: the last 4 characters
+  of the investor or account number, if one is shown, else null.
+- Its value is the ENDING capital balance for the period ("Ending capital", "Ending
+  balance", "Capital account balance", "Net asset value" or "Partner's capital, end of
+  period"), from the column for THIS period, never year-to-date or inception-to-date and
+  never the beginning balance.
+- Give exactly ONE holding per fund: description = the fund name, value = that ending
+  balance, quantity null, price null. statement_total = the same number. grand_total = null
+  unless the document shows a total across several funds.
+- Commitments, unfunded or remaining commitments, contributions, distributions, fees,
+  carried interest and gains are NOT the value; leave them out.
+- A negative ending balance is unusual: report it as shown."""
+
+
 def build_prompt(text: str, playbook: str | None = None,
                  previous_errors: list[str] | None = None,
-                 captured_at: str | None = None) -> list:
+                 captured_at: str | None = None, statement: bool = False,
+                 capital: bool = False) -> list:
     parts = []
+    if capital:
+        parts.append(CAPITAL_NOTE)
+    elif statement:
+        parts.append(STATEMENT_NOTE)
     if captured_at:
         parts.append(f"This document was captured at {captured_at} (UTC). A live portal page "
                      "shows values as of about that moment. If it shows a date without a "
@@ -78,8 +117,10 @@ def build_prompt(text: str, playbook: str | None = None,
 
 def extract(model, text: str, playbook: str | None = None,
             previous_errors: list[str] | None = None,
-            captured_at: str | None = None) -> Extraction:
-    reply = model.invoke(build_prompt(text, playbook, previous_errors, captured_at)).content
+            captured_at: str | None = None, statement: bool = False,
+            capital: bool = False) -> Extraction:
+    reply = model.invoke(build_prompt(text, playbook, previous_errors, captured_at,
+                                      statement, capital)).content
     try:
         return Extraction.model_validate(extract_json(reply))
     except (ValueError, ValidationError) as e:

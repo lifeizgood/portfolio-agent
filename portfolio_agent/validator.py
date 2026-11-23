@@ -37,8 +37,10 @@ def validate(snap: Snapshot, previous: Snapshot | None = None,
         warnings.append("No stated total to reconcile against.")
 
     for h in snap.holdings:
-        # V4 sign: assets are never negative; a liability (owed) is never positive
-        if not liability and h.value < 0:
+        # V4 sign: a liability (owed) is never positive. In an asset account a single
+        # holding may be negative (options written, cash borrowed on margin) only when
+        # the account shows a total for V2 to check the sum against.
+        if not liability and h.value < 0 and not snap.statement_total:
             errors.append(f"Negative value for {h.description}.")
         if liability and h.value > 0:
             errors.append(f"Positive value for {h.description} on a liability account.")
@@ -49,22 +51,24 @@ def validate(snap: Snapshot, previous: Snapshot | None = None,
         # V3 qty x price vs the portal's own value (no market feed, spec C3)
         if h.quantity is not None and h.price is not None and h.value:
             implied = h.quantity * h.price
-            if abs(implied - h.value) / abs(h.value) > config.VALUE_TOLERANCE:
+            off = lambda x: abs(x - h.value) / abs(h.value)
+            if off(implied) > config.VALUE_TOLERANCE and off(implied * 100) <= config.VALUE_TOLERANCE:
+                implied *= 100    # an option: price per share, 100 shares per contract
+            if off(implied) > config.VALUE_TOLERANCE:
                 errors.append(f"{h.description}: {h.quantity} x {h.price} = {implied:,.2f},"
                               f" but value is {h.value:,.2f}.")
 
     # V5 as-of not in the future. (V6, "not earlier than the last value", was
     # removed: out-of-order ingestion is valid, spec C4.)
+    # Up to one day ahead is accepted: portals often date values in Eastern time (or
+    # with the next business day), which can read as tomorrow here.
     if isinstance(today, datetime):
-        late_limit = today + timedelta(minutes=config.FUTURE_SLACK_MIN)
-        if snap.as_of_datetime > late_limit:
-            errors.append(f"As-of {snap.as_of_datetime:%Y-%m-%d %H:%M} is in the future.")
+        today_d = today.astimezone().date()
     else:
         today_d = today or now().astimezone().date()
-        if snap.as_of_date > today_d:
-            errors.append(f"As-of date {snap.as_of_date} is in the future.")
-        elif today is None and snap.as_of_datetime > now() + timedelta(minutes=config.FUTURE_SLACK_MIN):
-            errors.append(f"As-of {snap.as_of_datetime:%Y-%m-%d %H:%M} is in the future.")
+    latest_ok = today_d + timedelta(days=config.FUTURE_DAYS_OK)
+    if snap.as_of_date > latest_ok:
+        errors.append(f"As-of date {snap.as_of_date} is in the future.")
 
     # V8 continuity against the nearest earlier value. A big unexplained move may
     # well be real, so it is held for approval rather than rejected (spec C6:
@@ -117,10 +121,11 @@ _ACCOUNT_LINE = re.compile(
     r"^\s*(?:[A-Z0-9]{3}-[A-Z0-9]{5}|(?:\.{3}|…|[xX*]{3,}[- ]?)[A-Z0-9]{4})\s*$", re.M)
 
 
-def unlisted_accounts(text: str, ext: Extraction) -> list[str]:
+def unlisted_accounts(text: str, ext: Extraction, not_accounts=()) -> list[str]:
     """Account numbers on the page whose last 4 characters match no extracted account.
-    Deterministic, so a skipped account is caught even when it sits outside every total."""
-    have = {(a.account_suffix or "")[-4:] for a in ext.accounts}
+    Deterministic, so a skipped account is caught even when it sits outside every total.
+    Numbers the user said aren't accounts (a card, a routing number) are left out."""
+    have = {(a.account_suffix or "")[-4:] for a in ext.accounts} | set(not_accounts)
     missing = []
     for m in _ACCOUNT_LINE.finditer(text or ""):
         last4 = re.sub(r"[^A-Z0-9]", "", m.group(0).upper())[-4:]

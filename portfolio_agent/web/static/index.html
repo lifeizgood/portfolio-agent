@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Portfolio Agent</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="/style.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -42,7 +42,7 @@
       <label>From <input type="date" id="start"></label>
       <label>To <input type="date" id="end"></label>
       <label>View <select id="granularity"><option value="daily">Daily</option><option value="monthly">Monthly</option></select></label>
-      <label>Split by <select id="group"><option value="account">Account</option><option value="institution">Institution</option><option value="type">Type</option></select></label>
+      <label>Split by <select id="group"><option value="account">Account</option><option value="institution">Institution</option><option value="type">Type</option><option value="none">None (total only)</option></select></label>
       <label title="Show the history using only values retrieved by this date">As known on <input type="date" id="known-on"></label>
       <div id="basis-wrap" class="basis" hidden title="Accounts held by an entity you own part of (an LLC): count your percentage, or the whole account">Values
         <span class="seg" id="basis"><button data-b="share" class="on">Your share</button><button data-b="full">Full value</button></span></div>
@@ -99,8 +99,20 @@
     <h2>Logins</h2>
     <p class="muted">One login can hold several accounts. Every account found on a login's pages gets its own history.</p>
     <table id="login-list"><thead><tr><th>Login</th><th>Institution</th><th>Accounts</th><th>Cadence</th>
-      <th>Username &amp; password saved</th><th>Last fetched</th><th></th></tr></thead><tbody></tbody></table>
+      <th>Refresh supported</th><th>Last updated</th><th></th></tr></thead><tbody></tbody></table>
     <button id="new-login">Add login</button>
+  </div>
+
+  <div class="card" id="email-reader-card">
+    <h2>Verification codes by email</h2>
+    <p class="muted">For logins whose code arrives by email (two-step code: email). The fetcher reads the code from Gmail, read-only: only messages that arrive after it asks for a code and that come from the login's own site (or its <b>code sender</b>). Messages stay unread and nothing is stored. Needs a Google <b>app password</b>: Google Account → Security → 2-Step Verification → App passwords. Without this, the Inbox asks you for the code.</p>
+    <p id="email-reader-status" class="muted"></p>
+    <form id="email-reader-form" class="controls" autocomplete="off">
+      <label>Gmail address <input name="address" type="email" required maxlength="120"></label>
+      <label>App password <input name="app_password" type="password" required maxlength="40" autocomplete="new-password"></label>
+      <button type="submit">Check and save</button>
+      <button type="button" id="email-reader-remove">Remove</button>
+    </form>
   </div>
 
   <div class="card" id="owners-card">
@@ -122,32 +134,42 @@
         <label>Name<input name="name" required placeholder="Merrill Lynch"></label>
         <label>Institution<input name="institution" required placeholder="Merrill Lynch"></label>
         <label>Access method<select name="access_method">
-          <option value="browser">Browser</option><option value="api">API</option>
-          <option value="email_statement">Email statement</option><option value="manual">Manual</option></select></label>
+          <option value="browser">Browser</option><option value="upload">Upload statements</option>
+          <option value="api" disabled>API (not available yet)</option><option value="email_statement" disabled>Email statement (not available yet)</option>
+          <option value="manual" disabled>Manual (not available yet)</option></select></label>
         <label>Login page URL<input name="login_url" type="url" placeholder="https://www.mymerrill.com"></label>
         <label>Allowed domains<input name="allowed_domains" placeholder="defaults to the login page's domain"></label>
+        <label>Sign in with<select name="sign_in_with">
+          <option value="password">Username and password</option><option value="google">Google (sign in by hand first)</option></select></label>
         <label>2FA method<select name="twofa_method">
           <option value="remembered_device">Remembered device</option><option value="sms">SMS</option>
-          <option value="email">Email</option><option value="authenticator">Authenticator app</option></select></label>
-        <label>Cadence<select name="cadence"><option value="nightly">Nightly</option><option value="quarterly">Quarterly</option></select></label>
-        <label class="check"><input type="checkbox" name="holds_public" checked> Holds public securities (included in Refresh)</label>
+          <option value="email">Email</option></select></label>
+        <label>Statement type<select name="statement_kind">
+          <option value="account">Account statements (brokerage, bank)</option><option value="capital">Capital account statements (private funds)</option></select></label>
+        <label>Cadence<select name="cadence"><option value="nightly">Nightly</option><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option></select></label>
+        <label class="check"><input type="checkbox" name="refresh_supported"> Refresh supported (the app signs in and fetches this login; it's part of the Dashboard's Refresh). Unticked: you upload its statements.</label>
         <label>Status<select name="status"><option value="active">Active</option><option value="closed">Closed</option></select></label>
-        <label>Closed on<input name="closed_on" type="date"></label>
+        <label id="login-closed-on" hidden>Closed on<input name="closed_on" type="date"></label>
       </div>
       <details open><summary>Account rules for this login</summary>
         <div class="grid">
+          <label>Numbers that aren't accounts<input name="not_accounts" placeholder="e.g. a member or card number's last 4: 1234"></label>
           <label>Skip these categories<input name="skip_categories" placeholder="e.g. Investments (already fetched by another login)"></label>
           <label>Debts: store as negative<input name="liability_categories" placeholder="e.g. Loans, Credit cards"></label>
           <label class="check"><input type="checkbox" name="skip_other_institutions"> Skip accounts the page shows as held at another institution (e.g. Merrill on a Bank of America page)</label>
           <label class="check"><input type="checkbox" name="open_account_details"> Open each account's details page to read its exact name and account number (use when the overview shows only nicknames)</label>
           <label>On each details page, click this to show the account number<input name="account_number_link" maxlength="80" placeholder="e.g. Account &amp; Routing Numbers (blank = read the page as it is)"></label>
+          <label>Capital statements: documents tab<input name="documents_tab" maxlength="200" placeholder="e.g. Documents, or the page's https:// address (blank = read the summary page instead)"></label>
+          <label class="check"><input type="checkbox" name="read_landing_page"> Read the page shown after sign-in (e.g. a dashboard listing every account) instead of looking for a holdings page</label>
+          <label>Wait after sign-in (seconds)<input name="post_login_wait" type="number" min="0" max="180" placeholder="0"></label>
+          <label>Capital statements, per fund: file name contains<input name="document_name" maxlength="80" placeholder="e.g. Capital Statement (set = open each fund, then its documents)"></label>
+          <label>Capital statements, per fund: fund names are in column<input name="fund_column" maxlength="80" placeholder="e.g. Fund Name"></label>
         </div>
       </details>
       <details><summary>Login steps (optional; blank = detect automatically)</summary>
         <div class="grid">
-          <label>Username field selector<input name="username_selector" placeholder="e.g. #userid"></label>
-          <label>Password field selector<input name="password_selector" placeholder="e.g. input[type=password]"></label>
-          <label>Sign-in button selector<input name="submit_selector" placeholder="blank = press Enter"></label>
+          <label>Button that sends the code (on the sign-in form)<input name="otp_button" maxlength="80" placeholder="e.g. Generate New OTP (pressed after the password; then the code is typed and Login pressed)"></label>
+          <label>Emailed codes come from<input name="code_sender" maxlength="120" placeholder="blank = this login's own domains; e.g. dovetail.mu"></label>
           <label>Holdings page URLs, one per line<textarea name="holdings_urls" rows="3"
             placeholder="Pages that together show every account. Blank = the agent finds them."></textarea></label>
         </div>
@@ -156,12 +178,18 @@
         <button type="button" id="cancel-login">Cancel</button><span id="login-msg" class="msg"></span></div>
     </form>
 
+    <div id="statements-section" hidden>
+      <h3>Statements uploaded</h3>
+      <p class="muted">Upload each month's statements with <b>Upload statements</b> on this login's row: one per account, or one consolidated statement for all of them. Each account found is stored at the statement's closing date; a new account waits in the Inbox to be included or excluded. The files stay on this Mac.</p>
+      <table id="statement-list"><thead><tr><th>File</th><th>Uploaded</th><th>Result</th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+
     <div id="cred-section" hidden>
       <h3>Username and password</h3>
       <p class="muted">Stored encrypted on this Mac. Never sent to the model or written to logs.</p>
       <form id="cred-form" autocomplete="off">
         <div class="grid">
-          <label>Username<input name="username" autocomplete="off"></label>
+          <label>Username <span class="muted">(Sign in with Google: the Google account's email; leave the password blank)</span><input name="username" autocomplete="off"></label>
           <label>Password<span class="pw"><input name="password" type="password" autocomplete="new-password">
             <button type="button" id="eye" class="eye" title="Show password" aria-label="Show password">&#128065;</button></span></label>
         </div>
@@ -199,6 +227,6 @@
   <div id="source-body"></div>
 </dialog>
 
-<script src="app.js"></script>
+<script src="/app.js"></script>
 </body>
 </html>

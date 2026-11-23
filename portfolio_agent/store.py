@@ -86,6 +86,11 @@ CREATE TABLE IF NOT EXISTS logins (
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS app_secrets (       -- e.g. the Gmail reader; encrypted
+    name         TEXT PRIMARY KEY,
+    secret       BLOB NOT NULL,
+    updated_at   TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS login_credentials (
     login_id     INTEGER PRIMARY KEY REFERENCES logins(id),
     secret       BLOB NOT NULL,       -- encrypted; see crypto.py
@@ -126,6 +131,18 @@ CREATE TABLE IF NOT EXISTS owner_shares (      -- your percentage, from a date; 
     effective_from TEXT NOT NULL,              -- local date
     recorded_at    TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS statement_uploads (  -- statement files the user uploaded
+    id           INTEGER PRIMARY KEY,
+    login_id     INTEGER NOT NULL REFERENCES logins(id),
+    filename     TEXT NOT NULL,              -- name as uploaded
+    path         TEXT NOT NULL,              -- saved copy under data/private/statements
+    sha256       TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    uploaded_at  TEXT NOT NULL,
+    run_id       INTEGER,                    -- the run that last read it
+    outcome      TEXT,                       -- stored | held | mixed | review | stopped | error
+    detail       TEXT
+);
 CREATE TABLE IF NOT EXISTS login_attempts (
     id           INTEGER PRIMARY KEY,
     account_id   INTEGER NOT NULL,
@@ -148,10 +165,16 @@ _MIGRATIONS = {
     # Per-login rules: which listed accounts to skip, which are debts.
     "logins": {"skip_categories": "TEXT", "liability_categories": "TEXT",
                "skip_other_institutions": "INTEGER NOT NULL DEFAULT 0",
-               "open_account_details": "INTEGER NOT NULL DEFAULT 0"},
+               "open_account_details": "INTEGER NOT NULL DEFAULT 0",
+               "sign_in_with": "TEXT NOT NULL DEFAULT 'password'",   # password | google
+               "not_accounts": "TEXT",     # last 4s the page shows that aren't accounts
+               "statement_kind": "TEXT NOT NULL DEFAULT 'account'"},   # account | capital
     "run_items": {"login_id": "INTEGER", "evidence": "TEXT"},
     "login_attempts": {"login_id": "INTEGER"},
-    "runs": {"pid": "INTEGER", "login_ids": "TEXT"},   # logins the run covers (JSON list)
+    "runs": {"pid": "INTEGER", "login_ids": "TEXT",     # logins the run covers (JSON list)
+             "trigger": "TEXT",                         # dashboard | login | nightly
+             "cancel_requested": "INTEGER NOT NULL DEFAULT 0"},
+    "statement_uploads": {"text_sha256": "TEXT"},   # same statement, downloaded again
     "holdings": {"price_as_of": "TEXT"},   # a holding's own as-of date, when it has one       # process doing the run, to spot orphaned runs
 }
 
@@ -248,6 +271,25 @@ def write_snapshot(conn, snap: Snapshot, evidence: str | None = None,
     )
     conn.commit()
     return sid
+
+
+def same_statement_stored(conn, snap: Snapshot) -> int | None:
+    """An earlier statement already stored exactly these values for this account and
+    date (the same statement read again): its snapshot id, else None."""
+    if snap.account_id is None:
+        return None
+    mine = sorted((h.symbol or "", h.description, round(h.value, 2)) for h in snap.holdings)
+    for r in conn.execute("SELECT id, total FROM snapshots WHERE account_id=? AND as_of_date=?"
+                          " AND source='statement' ORDER BY id DESC",
+                          (snap.account_id, snap.as_of_date.isoformat())):
+        if abs(r["total"] - snap.total) > 0.005:
+            continue
+        theirs = sorted((h["symbol"] or "", h["description"], round(h["value"], 2)) for h in
+                        conn.execute("SELECT symbol, description, value FROM holdings"
+                                     " WHERE snapshot_id=?", (r["id"],)))
+        if theirs == mine:
+            return r["id"]
+    return None
 
 
 def _key_args(snap: Snapshot) -> tuple[str, tuple]:
@@ -558,6 +600,41 @@ def save_steps(conn, institution: str, steps: dict) -> None:
     conn.commit()
 
 
+# --- uploaded statements -----------------------------------------------------
+
+def add_upload(conn, login_id: int, filename: str, path: str, sha256: str, size: int,
+               text_sha256: str | None = None) -> int:
+    cur = conn.execute("INSERT INTO statement_uploads (login_id, filename, path, sha256, size,"
+                       " uploaded_at, text_sha256) VALUES (?,?,?,?,?,?,?)",
+                       (login_id, filename, path, sha256, size, now_iso(), text_sha256))
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_upload(conn, upload_id: int) -> dict | None:
+    r = conn.execute("SELECT * FROM statement_uploads WHERE id=?", (upload_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def find_uploads(conn, login_id: int, sha256: str, text_sha256: str | None = None) -> list[dict]:
+    """Earlier uploads of the same file, or of a file with the same text (the same
+    statement downloaded again), oldest first."""
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM statement_uploads WHERE login_id=? AND (sha256=? OR text_sha256=?)"
+        " ORDER BY id", (login_id, sha256, text_sha256 or "-"))]
+
+
+def list_uploads(conn, login_id: int) -> list[dict]:
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM statement_uploads WHERE login_id=? ORDER BY id DESC", (login_id,))]
+
+
+def set_upload_result(conn, upload_id: int, run_id: int, outcome: str, detail: str) -> None:
+    conn.execute("UPDATE statement_uploads SET run_id=?, outcome=?, detail=? WHERE id=?",
+                 (run_id, outcome, detail, upload_id))
+    conn.commit()
+
+
 # --- runs and login attempts -------------------------------------------------
 
 def start_run(conn, kind: str) -> int:
@@ -644,9 +721,25 @@ def last_run(conn, kind: str | None = None) -> dict | None:
     return get_run(conn, r["id"]) if r else None
 
 
-def set_run_logins(conn, run_id: int, login_ids: list[int]) -> None:
-    conn.execute("UPDATE runs SET login_ids=? WHERE id=?", (json.dumps(login_ids), run_id))
+def set_run_logins(conn, run_id: int, login_ids: list[int], trigger: str | None = None) -> None:
+    conn.execute("UPDATE runs SET login_ids=?, trigger=COALESCE(?, trigger) WHERE id=?",
+                 (json.dumps(login_ids), trigger, run_id))
     conn.commit()
+
+
+def request_cancel(conn, run_id: int) -> bool:
+    """Ask a running run to stop. It stops at its next check: between pages, while
+    waiting for a code, or before reading a captured page. Reading already under way
+    (the model) finishes first. False if the run isn't running."""
+    cur = conn.execute("UPDATE runs SET cancel_requested=1 WHERE id=? AND status='running'",
+                       (run_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def cancel_requested(conn, run_id: int) -> bool:
+    r = conn.execute("SELECT cancel_requested FROM runs WHERE id=?", (run_id,)).fetchone()
+    return bool(r and r[0])
 
 
 def busy_login_ids(conn) -> set[int]:

@@ -2,7 +2,13 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-data/portfolio.db
+# databases hold real balances: never commit one (backups included)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
 .env
 .DS_Store
 data/private/
+*.db.bak*
+*.bak-*

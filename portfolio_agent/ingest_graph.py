@@ -14,6 +14,7 @@ captured (`text`, plus `evidence`, the folder View Source shows). The order is
 fixed in code; the LLM only does the extraction step.
 """
 
+import re
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -21,8 +22,8 @@ from langgraph.graph import END, START, StateGraph
 from . import config, registry, store
 from .documents import read_text
 from .extractor import ExtractionError, extract
-from .schemas import Extraction, Snapshot
-from .timeutil import now_iso, parse_iso
+from .schemas import Extraction, Holding, Snapshot
+from .timeutil import now_iso, parse_as_of, parse_iso
 from .validator import unlisted_accounts, validate, validate_extraction
 
 MAX_ATTEMPTS = 2   # retry semantics are deferred (spec C2); current behavior kept
@@ -48,6 +49,74 @@ class IngestState(TypedDict, total=False):
     details: list[dict]       # account details pages: [{label, suffix}], number read by code
 
 
+_OPTION_DESC = re.compile(r"^\s*(CALL|PUT)\b", re.I)
+_OPTION_SYMBOL = re.compile(r"^[A-Z.]{1,6}\d{6}[CP]\d+(\.\d+)?$")
+SHARES_PER_CONTRACT = 100
+
+
+def is_option(h) -> bool:
+    return bool(_OPTION_DESC.match(h.description or "")
+                or _OPTION_SYMBOL.match((h.symbol or "").replace(" ", "").upper()))
+
+
+def balance_holdings(ext: Extraction) -> Extraction:
+    """A balance-only account (a card, a loan, a bank account) read with its total but
+    no holdings gets one holding worth that total, named after the account. Done in code
+    so a missing line item doesn't send a correct balance back to the model."""
+    accounts = []
+    for rows in ext.accounts:
+        if not rows.holdings and rows.statement_total is not None:
+            rows = rows.model_copy(update={"holdings": [Holding(
+                description=rows.account, value=rows.statement_total)]})
+        accounts.append(rows)
+    return ext.model_copy(update={"accounts": accounts})
+
+
+def value_sold_options(ext: Extraction) -> Extraction:
+    """A sold (written) option is owed: its value is -(contracts x 100 x price per share),
+    whatever sign the statement prints for it. Computed here, not left to the model.
+    Its account's holdings still have to add up to the stated total (V2)."""
+    accounts = []
+    for rows in ext.accounts:
+        holdings = []
+        for h in rows.holdings:
+            if is_option(h) and h.quantity is not None and h.quantity < 0 and h.price:
+                price = abs(h.price)
+                h = h.model_copy(update={
+                    "price": price,
+                    "value": round(-abs(h.quantity) * SHARES_PER_CONTRACT * price, 2)})
+            holdings.append(h)
+        accounts.append(rows.model_copy(update={"holdings": holdings}))
+    return ext.model_copy(update={"accounts": accounts})
+
+
+def apply_statement_number(ext: Extraction, text: str, institution: str | None) -> Extraction:
+    """A one-account statement prints its account number: code reads the last 4, not
+    the model. Only when the statement shows exactly one number and the model found
+    exactly one account in it."""
+    from .statement_guides import guide_for, statement_number
+    number = statement_number(text, guide_for(institution))
+    if not number or len(ext.accounts) != 1:
+        return ext
+    rows = ext.accounts[0].model_copy(update={"account_suffix": number})
+    return ext.model_copy(update={"accounts": [rows]})
+
+
+def apply_row_dates(ext: Extraction, text: str, institution: str | None) -> Extraction:
+    """A portal table that dates each row ("As of Date"): code reads each account's date
+    from its row and it overrides the model's."""
+    from .statement_guides import account_date, guide_for, row_dates
+    dates = row_dates(text, guide_for(institution))
+    if not dates:
+        return ext
+    accounts = []
+    for rows in ext.accounts:
+        d = account_date(rows.account, dates)
+        accounts.append(rows if d is None else
+                        rows.model_copy(update={"as_of_datetime": parse_as_of(d)}))
+    return ext.model_copy(update={"accounts": accounts})
+
+
 def apply_detail_numbers(ext: Extraction, details: list[dict]) -> Extraction:
     """An account's number comes from its own details page, read by code, not from
     the model: the account whose name is the link that was clicked gets that page's
@@ -69,16 +138,20 @@ def apply_detail_numbers(ext: Extraction, details: list[dict]) -> Extraction:
 
 def _snapshot(ext: Extraction, rows, institution: str, source: str,
               liability: bool = False) -> Snapshot:
-    """A liability (loan, card) is owed, so its values are stored negative."""
-    sign = -1 if liability else 1
-    holdings = [h.model_copy(update={"value": sign * abs(h.value),
-                                     "price": None if liability else h.price,
-                                     "quantity": None if liability else h.quantity})
+    """A liability (loan, card) is owed, so its values are stored negative. An asset
+    account keeps each value's own sign: a sold option or margin cash is negative."""
+    as_of = rows.as_of_datetime or ext.as_of_datetime    # a fund's own date, else the page's
+    if not liability:
+        return Snapshot(institution=institution, account=rows.account,
+                        as_of_datetime=as_of,
+                        statement_total=rows.statement_total,
+                        holdings=list(rows.holdings), source=source)
+    holdings = [h.model_copy(update={"value": -abs(h.value), "price": None, "quantity": None})
                 for h in rows.holdings]
     total = rows.statement_total
     return Snapshot(institution=institution, account=rows.account,
-                    as_of_datetime=ext.as_of_datetime,
-                    statement_total=None if total is None else sign * abs(total),
+                    as_of_datetime=as_of,
+                    statement_total=None if total is None else -abs(total),
                     holdings=holdings, source=source)
 
 
@@ -119,8 +192,10 @@ def _closed_account(conn, login: dict | None, rows, ext: Extraction, state) -> d
 
 def build_ingest_graph(model, conn, today=None):
     def load(state: IngestState) -> IngestState:
-        text = state.get("text") or read_text(state["path"])
-        return {"text": text, "attempts": 0, "errors": [], "results": [],
+        accepted = state.get("extraction") is not None   # re-checking what was read before
+        text = state.get("text") if accepted else (state.get("text") or read_text(state["path"]))
+        return {"text": text or "", "attempts": MAX_ATTEMPTS if accepted else 0,
+                "errors": [], "results": [],
                 "evidence": state.get("evidence") or state.get("path"),
                 "retrieved_at": state.get("retrieved_at") or now_iso()}
 
@@ -128,13 +203,31 @@ def build_ingest_graph(model, conn, today=None):
         login = state.get("login")
         inst = login["institution"] if login else state.get("institution")
         playbook = store.get_playbook(conn, inst) if inst else None
+        from .statement_guides import guide_for
+        guide = guide_for(inst)
+        if guide:   # the institution's statement layout, or its portal page's layout
+            notes = guide.notes if state.get("source") == "statement" else guide.portal_notes
+            playbook = "\n\n".join(x for x in (notes, playbook) if x)
         attempts = state["attempts"] + 1
         try:
             ext = extract(model, state["text"], playbook, state.get("errors") or None,
-                          captured_at=state["retrieved_at"] if state.get("source") == "portal" else None)
+                          captured_at=state["retrieved_at"] if state.get("source") == "portal" else None,
+                          statement=state.get("source") == "statement",
+                          capital=state.get("source") == "statement" and bool(login)
+                          and login.get("statement_kind") == "capital")
         except ExtractionError as e:
             return {"extraction": None, "errors": [str(e)], "attempts": attempts}
         ext = apply_detail_numbers(ext, state.get("details") or [])
+        if state.get("source") == "statement":
+            ext = apply_statement_number(ext, state["text"], inst)
+        else:
+            ext = apply_row_dates(ext, state["text"], inst)
+        ext = value_sold_options(balance_holdings(ext))
+        if ext.as_of_datetime is None and state.get("source") == "statement":
+            # A statement is dated by its period; the upload time would misdate it.
+            return {"extraction": None, "attempts": attempts, "errors": [
+                "No statement date was found. Give as_of as the closing date of the "
+                "statement period."]}
         if ext.as_of_datetime is None:   # no date shown: use the capture time (spec D16)
             ext = ext.model_copy(update={"as_of_datetime": parse_iso(state["retrieved_at"])})
         return {"extraction": ext.model_dump(mode="json"), "attempts": attempts}
@@ -145,7 +238,9 @@ def build_ingest_graph(model, conn, today=None):
         ext = Extraction.model_validate(state["extraction"])
         login = state.get("login")
         inst = login["institution"] if login else (ext.institution or state.get("institution") or "")
-        errors = validate_extraction(ext) + unlisted_accounts(state["text"], ext)
+        errors = validate_extraction(ext) + unlisted_accounts(
+            state["text"], ext, (registry.last4s(login.get("not_accounts"))
+                                 + registry.set_aside_last4s(conn, login["id"])) if login else ())
         if state.get("source") == "portal":   # V13: a live page's date is about now
             age = parse_iso(state["retrieved_at"]) - ext.as_of_datetime
             if age.days > config.PORTAL_MAX_AGE_DAYS:
@@ -179,7 +274,10 @@ def build_ingest_graph(model, conn, today=None):
         login = state.get("login")
         inst = login["institution"] if login else (ext.institution or state.get("institution") or "")
         results = []
-        if login:   # an account whose number was misread before keeps its entry
+        # An account whose number was misread before keeps its entry. Only for portal
+        # pages, which list all of a login's accounts at once: a statement covers one
+        # account, so another account of the same name is simply not in it.
+        if login and state.get("source") != "statement":
             registry.relink_accounts(conn, login, [r for r in ext.accounts if not r.closed
                                                    and not registry.skip_reason(login, r)])
         for rows in ext.accounts:
@@ -232,6 +330,11 @@ def build_ingest_graph(model, conn, today=None):
                              "retrieved_at": state["retrieved_at"]})
                 results.append({"account": snap.account, "account_id": snap.account_id,
                                  "outcome": "held", "review_id": rid, "holds": holds})
+            elif (state.get("source") == "statement"
+                  and (same := store.same_statement_stored(conn, snap))):
+                # The same statement read again: these values are already stored.
+                results.append({"account": snap.account, "account_id": snap.account_id,
+                                "outcome": "unchanged", "snapshot_id": same})
             else:
                 sid = store.write_snapshot(conn, snap, evidence=state["evidence"],
                                            retrieved_at=state["retrieved_at"],
@@ -254,7 +357,9 @@ def build_ingest_graph(model, conn, today=None):
             conn, reason="; ".join(state["errors"]),
             institution=login.get("institution") or state.get("institution"),
             account=login.get("name"), login_id=login.get("id"), evidence=state["evidence"],
-            payload={"extraction": state.get("extraction")} if state.get("extraction") else None)
+            payload={"extraction": state.get("extraction"), "source": state.get("source"),
+                     "retrieved_at": state.get("retrieved_at"), "run_id": state.get("run_id")}
+            if state.get("extraction") else None)
         return {"outcome": "review", "review_id": rid}
 
     g = StateGraph(IngestState)
@@ -264,12 +369,50 @@ def build_ingest_graph(model, conn, today=None):
     g.add_node("commit", commit)
     g.add_node("review", review)
     g.add_edge(START, "load")
-    g.add_edge("load", "extract")
+    g.add_conditional_edges("load", lambda s: "validate" if s.get("extraction") else "extract",
+                            ["validate", "extract"])
     g.add_edge("extract", "validate")
     g.add_conditional_edges("validate", route, ["commit", "extract", "review"])
     g.add_edge("commit", END)
     g.add_edge("review", END)
     return g.compile()
+
+
+_UNLISTED = re.compile(r"^The page lists an account ending (\w{1,4}) that wasn't extracted\.")
+
+
+def unlisted_numbers(reason: str) -> list[str] | None:
+    """The numbers a "Rejected twice" item says weren't extracted, if that was its only
+    problem; else None."""
+    parts = [p.strip() for p in (reason or "").split("; ") if p.strip()]
+    found = [_UNLISTED.match(p) for p in parts]
+    return [m.group(1) for m in found] if parts and all(found) else None
+
+
+def accept_review(conn, item_id: int) -> dict:
+    """The user accepts the accounts read on a page rejected only because it shows
+    numbers that weren't read as accounts. Those numbers are remembered as not being
+    accounts for this login, and the accounts read go through every other check again,
+    then are stored or held as usual."""
+    item = store.get_inbox_item(conn, item_id)
+    if not item or item["kind"] != "review" or item["status"] != "open":
+        raise ValueError("Not an open rejected item.")
+    p = item["payload"] or {}
+    numbers = unlisted_numbers(item["reason"])
+    if not p.get("extraction") or numbers is None or not item.get("login_id"):
+        raise ValueError("Only a page whose one problem is numbers that weren't read as "
+                         "accounts can be accepted; dismiss it instead.")
+    registry.add_not_accounts(conn, item["login_id"], numbers)
+    login = registry.get_login(conn, item["login_id"])
+    evidence = item["evidence"] or ""
+    source = p.get("source") or ("statement" if evidence.lower().endswith(".pdf") else "portal")
+    out = build_ingest_graph(None, conn).invoke({
+        "extraction": p["extraction"], "text": "", "evidence": evidence, "login": login,
+        "source": source, "run_id": p.get("run_id"),
+        "retrieved_at": p.get("retrieved_at") or item["created_at"]})
+    store.resolve_inbox_item(conn, item_id, "approved" if out["outcome"] != "review" else "rejected")
+    return {"outcome": out["outcome"], "not_accounts": registry.last4s(login.get("not_accounts")),
+            "results": out.get("results") or [], "errors": out.get("errors") or []}
 
 
 def approve_held(conn, item_id: int) -> int:

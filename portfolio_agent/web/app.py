@@ -18,11 +18,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import config, registry, series, store
-from ..ingest_graph import approve_held
+from ..ingest_graph import accept_review, approve_held
 from ..runner import run_logins, select_logins
 from ..timeutil import now, parse_iso
 
 STATIC = Path(__file__).parent / "static"
+SECTIONS = {"dashboard", "inbox", "accounts", "debug"}   # tabs with their own address
 EVIDENCE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".txt": "text/plain",
                   ".json": "text/plain", ".pdf": "application/pdf",
                   ".html": "text/plain"}   # portal HTML is shown as text, never rendered
@@ -30,7 +31,12 @@ EVIDENCE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".txt": "text/plain
 
 class CredentialsIn(BaseModel):
     username: str
-    password: str
+    password: str = ""     # blank for "Sign in with Google": the username is the Google account
+
+
+class EmailReaderIn(BaseModel):
+    address: str
+    app_password: str
 
 
 class AnswerIn(BaseModel):
@@ -43,6 +49,10 @@ class OwnerNameIn(BaseModel):
 
 class KillIn(BaseModel):
     on: bool
+
+
+class ReadUploadsIn(BaseModel):
+    upload_ids: list[int]
 
 
 _START_LOCK = threading.Lock()
@@ -176,6 +186,11 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
         item = _open_item(c, iid)
         if item["kind"] == "held_value":
             return {"snapshot_id": approve_held(c, iid)}
+        if item["kind"] == "review":
+            try:
+                return accept_review(c, iid)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
         if item["kind"] == "playbook_proposal":
             p = item["payload"]
             steps = registry.steps_for(c, p["institution"])
@@ -241,6 +256,33 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
             registry.set_credentials(c, lid, body.username, body.password)
         except ValueError as e:
             raise HTTPException(404, str(e))
+        return {"ok": True}
+
+    @app.get("/api/email-reader")
+    def email_reader(c=Depends(conn)):
+        from .. import email_codes
+        s = email_codes.get_settings(c)
+        return {"configured": bool(s), "address": s["address"] if s else None}
+
+    @app.put("/api/email-reader")
+    def put_email_reader(body: EmailReaderIn, c=Depends(conn)):
+        """Checks the Gmail sign-in first (reads no messages), then saves it encrypted."""
+        from .. import email_codes
+        settings = {"address": body.address.strip(),
+                    "app_password": "".join(body.app_password.split())}
+        try:
+            if "@" not in settings["address"] or len(settings["app_password"]) < 8:
+                raise ValueError("Enter the Gmail address and its 16-letter app password.")
+            email_codes.check(settings)
+            email_codes.save_settings(c, settings["address"], settings["app_password"])
+        except (ValueError, email_codes.EmailUnavailable) as e:
+            raise HTTPException(400, str(e))
+        return {"ok": True}
+
+    @app.delete("/api/email-reader")
+    def delete_email_reader(c=Depends(conn)):
+        from .. import email_codes
+        email_codes.clear_settings(c)
         return {"ok": True}
 
     @app.get("/api/logins/{lid}/credentials")
@@ -312,11 +354,84 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
         lg = registry.get_login(c, lid)
         if not lg:
             raise HTTPException(404)
-        if lg["status"] != "active" or lg["access_method"] != "browser":
-            raise HTTPException(400, "Only an active browser login can be refreshed.")
+        if lg["status"] != "active" or not lg["refresh_supported"]:
+            raise HTTPException(400, "Refresh isn't supported for this login; upload its "
+                                "statements instead.")
         return start_refresh(c, [lid])
 
+    # --- uploaded statements ----------------------------------------------------
+
+    @app.get("/api/logins/{lid}/statements")
+    def list_statements(lid: int, c=Depends(conn)):
+        if not registry.get_login(c, lid):
+            raise HTTPException(404)
+        return [_upload_view(u) for u in store.list_uploads(c, lid)]
+
+    @app.post("/api/logins/{lid}/statements")
+    async def upload_statement(lid: int, request: Request, c=Depends(conn)):
+        """One PDF per request, sent as the raw body; X-Filename carries its name."""
+        from urllib.parse import unquote
+
+        from ..statements import UploadError, save_upload
+        lg = registry.get_login(c, lid)
+        if not lg:
+            raise HTTPException(404)
+        if lg["status"] != "active":
+            raise HTTPException(400, "This login is closed.")
+        size = int(request.headers.get("content-length") or 0)
+        if size > config.MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(413, f"The file is over {config.MAX_UPLOAD_MB} MB.")
+        data = await request.body()
+        try:
+            up = save_upload(c, lg, unquote(request.headers.get("x-filename") or ""), data)
+        except UploadError as e:
+            raise HTTPException(400, str(e))
+        return _upload_view(up)
+
+    @app.post("/api/logins/{lid}/statements/read")
+    def read_statements(lid: int, body: ReadUploadsIn, c=Depends(conn)):
+        """Read the given uploads with the model, in the background, as one run."""
+        from ..statements import read_uploads
+        lg = registry.get_login(c, lid)
+        if not lg:
+            raise HTTPException(404)
+        ids = list(dict.fromkeys(body.upload_ids))
+        ups = [store.get_upload(c, i) for i in ids]
+        if not ids or any(u is None or u["login_id"] != lid for u in ups):
+            raise HTTPException(400, "Unknown statement for this login.")
+        _expire_stuck_runs(c)
+        with _START_LOCK:
+            if lid in store.busy_login_ids(c):
+                raise HTTPException(409, "This login is already being refreshed or read.")
+            run_id = store.start_run(c, "upload")
+            store.set_run_logins(c, run_id, [lid], "login")
+
+        def work():
+            wc = store.connect(db_path)
+            try:
+                read_uploads(wc, run_id, lg, ids, loader)
+            except Exception as e:   # keep the run from looking stuck
+                store.finish_run(wc, run_id, "failed", f"{type(e).__name__}: {e}")
+            finally:
+                wc.close()
+
+        if run_in_thread:
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            work()
+        return {"run_id": run_id}
+
+    @app.get("/api/statements/{uid}/file")
+    def statement_file(uid: int, c=Depends(conn)):
+        up = store.get_upload(c, uid)
+        if not up or not Path(up["path"]).is_file():
+            raise HTTPException(404)
+        return FileResponse(up["path"], media_type="application/pdf",
+                            headers={"Content-Security-Policy": "sandbox",
+                                     "X-Content-Type-Options": "nosniff"})
+
     def start_refresh(c, login_ids: list[int] | None) -> dict:
+        dashboard = login_ids is None
         """Refreshes run in parallel, one per institution at a time (logins at one
         institution share a browser profile), up to MAX_PARALLEL_RUNS at once."""
         _expire_stuck_runs(c)
@@ -337,7 +452,8 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
                 if due and not login_ids:
                     raise HTTPException(409, "Every login is already being refreshed.")
             run_id = store.start_run(c, "refresh")
-            store.set_run_logins(c, run_id, login_ids)
+            store.set_run_logins(c, run_id, login_ids,
+                                 "dashboard" if dashboard else "login")
 
         def work():
             wc = store.connect(db_path)
@@ -354,6 +470,15 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
         else:
             work()
         return {"run_id": run_id}
+
+    @app.post("/api/runs/{rid}/cancel")
+    def cancel_run(rid: int, c=Depends(conn)):
+        """Cancel button: the run stops at its next check; values it already stored stay."""
+        if not store.get_run(c, rid):
+            raise HTTPException(404)
+        if not store.request_cancel(c, rid):
+            raise HTTPException(409, "This run has already finished.")
+        return {"ok": True}
 
     @app.get("/api/runs")
     def runs(limit: int = 100, c=Depends(conn)):
@@ -387,6 +512,18 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
             config.KILL_FILE.unlink()
         return {"kill_switch": config.KILL_FILE.exists()}
 
+    @app.get("/{section}", include_in_schema=False)
+    @app.get("/{section}/", include_in_schema=False)
+    def section_page(section: str):
+        """Each part of the dashboard has its own address (/inbox, /accounts, ...): the
+        same page, which opens that tab. Other paths fall through to the static files."""
+        if section not in SECTIONS:
+            target = STATIC / section
+            if target.is_file():
+                return FileResponse(target)
+            raise HTTPException(404)
+        return FileResponse(STATIC / "index.html")
+
     app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")
     return app
 
@@ -396,6 +533,12 @@ def _open_item(c, iid: int) -> dict:
     if not item or item["status"] != "open":
         raise HTTPException(404, "No open item with that id.")
     return item
+
+
+def _upload_view(up: dict) -> dict:
+    """An upload as the UI shows it; the file's location stays on the server."""
+    return {k: up.get(k) for k in ("id", "filename", "size", "uploaded_at", "run_id",
+                                   "outcome", "detail", "duplicate", "already_read")}
 
 
 def _expire_stuck_runs(c) -> None:
