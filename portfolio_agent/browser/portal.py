@@ -1,6 +1,6 @@
 """Portal fetcher (spec §4): log in, reach the holdings page, save the evidence.
 
-Playbook steps first (login selectors, saved holdings URL); the LLM navigator
+Playbook steps first (saved holdings URL); the LLM navigator
 only when no route is saved or the saved one fails. A route the navigator finds
 comes back as a playbook proposal for the user to approve (spec D14).
 
@@ -28,9 +28,11 @@ from .navigator import navigate_to_holdings
 USERNAME_IN_FORM = "input[type=email], input[type=text], input[type=tel], input:not([type])"
 # Fields that are clearly a username / user ID, even with no password field on the page yet
 # (two-step logins ask for the user ID first, then the password).
-USERNAME_FIELDS = ("input[autocomplete='username'], input[name*='user' i], input[id*='user' i],"
-                   " input[name*='onlineid' i], input[id*='onlineid' i], input[name*='login' i],"
-                   " input[id*='login' i], input[type=email]")
+_EDITABLE = ":not([readonly]):not([disabled])"   # a profile page's read-only email isn't a form
+USERNAME_FIELDS = ", ".join(f"{sel}{_EDITABLE}" for sel in (
+    "input[autocomplete='username']", "input[name*='user' i]", "input[id*='user' i]",
+    "input[name*='onlineid' i]", "input[id*='onlineid' i]", "input[name*='login' i]",
+    "input[id*='login' i]", "input[type=email]"))
 # A code box is a text-like input: never a radio button or checkbox (a "how should we
 # send it?" page often names its radios after the code, e.g. authCodeDelivery).
 _TEXTLIKE = ":not([type=radio]):not([type=checkbox]):not([type=hidden]):not([type=submit]):not([type=button])"
@@ -66,6 +68,8 @@ class Evidence:
     trace: list = field(default_factory=list)
     # Account details pages opened: [{"label": link text, "suffix": last 4 read by code}]
     details: list = field(default_factory=list)
+    # Statements downloaded from the portal's documents page: [{"name", "data": bytes}]
+    documents: list = field(default_factory=list)
 
 
 @dataclass
@@ -170,13 +174,19 @@ def fetch_portal(login: dict, creds: dict | None, ctx: FetchContext) -> Evidence
     domains = registry.domains(login)
     steps = registry.steps_for(ctx.conn, login["institution"])
     trace = ctx.trace
-    profile = config.BROWSER_PROFILES_DIR / _slug(login["institution"])
+    profile, channel = browser_profile(login)
     profile.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch_persistent_context(
-            str(profile), headless=config.HEADLESS, accept_downloads=False,
-            viewport={"width": 1400, "height": 1000})
+        try:
+            browser = p.chromium.launch_persistent_context(
+                str(profile), headless=config.HEADLESS, channel=channel,
+                accept_downloads=login.get("statement_kind") == "capital",
+                viewport={"width": 1400, "height": 1000})
+        except Exception as e:
+            if PROFILE_IN_USE.search(str(e)):
+                raise FetchStopped("profile_busy", profile_busy_message(login)) from None
+            raise
         holder = None
         try:
             holder = _Holder(browser.pages[0] if browser.pages else browser.new_page(),
@@ -204,6 +214,20 @@ def fetch_portal(login: dict, creds: dict | None, ctx: FetchContext) -> Evidence
             browser.on("page", lambda pg: setattr(holder, "page", pg))  # follow new tabs
 
             _login(holder, login, creds, steps, ctx)
+            _wait_after_login(holder, steps, trace)
+
+            if login.get("statement_kind") == "capital" and steps.get("document_name"):
+                # each fund's own documents tab (e.g. Star Mountain)
+                docs = _fetch_fund_documents(holder, browser, login, steps, domains, trace, ctx)
+                ev = _save_evidence([_capture_page(holder.page, 1)], login, trace, None)
+                ev.documents = docs
+                return ev
+            if login.get("statement_kind") == "capital" and steps.get("documents_tab"):
+                # statements from the portal's documents page
+                docs = _fetch_documents(holder, browser, login, steps, domains, trace, ctx)
+                ev = _save_evidence([_capture_page(holder.page, 1)], login, trace, None)
+                ev.documents = docs
+                return ev
 
             proposal = None
             pages: list[tuple] = []      # (url, text, screenshot-taker) per captured page
@@ -221,6 +245,16 @@ def fetch_portal(login: dict, creds: dict | None, ctx: FetchContext) -> Evidence
                     pages = []
                     break
                 pages.append(_capture_page(holder.page, n))
+            if not pages and steps.get("read_landing_page"):   # the page after sign-in
+                trace.add("landing_page_read")
+                pages = [_capture_page(holder.page, 1)]
+            if not pages:      # a page the institution's guide knows is already showing
+                from ..statement_guides import guide_for
+                guide = guide_for(login["institution"])
+                if guide and guide.portal_marker and guide.portal_marker.lower() in \
+                        _body_text(holder.page).lower():
+                    trace.add("guide_page_found", marker=guide.portal_marker)
+                    pages = [_capture_page(holder.page, 1)]
             if not pages:
                 trace.add("llm_navigation_start")
                 result = navigate_to_holdings(
@@ -251,6 +285,873 @@ def fetch_portal(login: dict, creds: dict | None, ctx: FetchContext) -> Evidence
             browser.close()
 
 
+# --- Statements from a portal's documents page (capital account statements) -----------
+
+def _exact(label: str):
+    return re.compile(rf"^\s*{re.escape(label.strip())}\s*$", re.I)
+
+
+_IN_NAV = ("e => !!e.closest('nav, aside, header, [role=navigation], [role=banner], "
+           "[class*=sidebar i], [class*=side-nav i], [class*=sidenav i], [id*=sidebar i]')")
+
+
+def _find_control(page, label: str, roles=("tab", "link", "button", "menuitem")):
+    """A visible control named exactly `label`, else one containing it. One in the page's
+    content (a fund page's own Documents tab) wins over one in the side or top navigation."""
+    for pattern in (_exact(label), re.compile(re.escape(label.strip()), re.I)):
+        in_nav = None
+        for role in roles:
+            try:
+                loc = page.get_by_role(role, name=pattern)
+                for i in range(min(loc.count(), 8)):
+                    el = loc.nth(i)
+                    if not el.is_visible():
+                        continue
+                    try:
+                        nav = el.evaluate(_IN_NAV)
+                    except Exception:
+                        nav = False
+                    if not nav:
+                        return el
+                    in_nav = in_nav or el
+            except Exception:
+                continue
+        if in_nav is not None:
+            return in_nav
+    return None
+
+
+def _safe_click(el, page, domains, trace, what: str) -> None:
+    label = ""
+    try:
+        label = (el.inner_text(timeout=2000) or "")[:80]
+        href = el.get_attribute("href") or ""
+    except Exception:
+        href = ""
+    verdict = check_click(label, urljoin(page.url, href) if href else "", page.url, domains)
+    if verdict:
+        raise FetchStopped("blocked_click", f"Refused to click {what} ({label!r}).")
+    el.click(timeout=15000)
+    trace.add("click", what=what)
+
+
+def _apply_filter(page, label: str, domains, trace) -> bool:
+    """Show only the statements: a dropdown option, a checkbox or a filter button."""
+    for sel in page.locator("select").all()[:10]:
+        try:
+            options = [o.strip() for o in sel.locator("option").all_inner_texts()]
+            match = [o for o in options if o.lower() == label.lower()] or \
+                    [o for o in options if label.lower() in o.lower()]
+            if match and sel.is_visible():
+                sel.select_option(label=match[0])
+                trace.add("filter_selected", how="dropdown")
+                return True
+        except Exception:
+            continue
+    for attempt in range(2):
+        for role in ("checkbox", "radio"):
+            try:
+                box = page.get_by_role(role, name=re.compile(re.escape(label), re.I)).first
+                if box.count() and box.is_visible():
+                    if not box.is_checked():
+                        box.check(timeout=10000)
+                    trace.add("filter_selected", how=role)
+                    return True
+            except Exception:
+                continue
+        el = _find_control(page, label, ("option", "button", "tab", "link", "menuitem"))
+        if el is not None:
+            _safe_click(el, page, domains, trace, "the statement filter")
+            return True
+        # the choices may sit behind a "Filter" / "Document type" control
+        opener = _find_control(page, "Document Type", ("button", "combobox")) or \
+            _find_control(page, "Filter", ("button", "combobox"))
+        if attempt or opener is None:
+            break
+        _safe_click(opener, page, domains, trace, "the filter menu")
+        page.wait_for_timeout(800)
+    return False
+
+
+DOWNLOAD_NAME = re.compile(r"\bdownload\b|\.pdf\b|\bpdf\b|\bview\b", re.I)
+
+
+_SEARCH_BOX = ("input[type=search], [role=searchbox], input[placeholder*='search' i],"
+               " input[aria-label*='search' i], input[name*='search' i], input[id*='search' i]")
+
+
+def _search(page, term: str, trace) -> bool:
+    """Type the term into the documents page's own search box (on the login's site; this
+    page was reached through the allowlist) and search. A search, never a login form."""
+    box = page.locator(_SEARCH_BOX)
+    for i in range(min(box.count(), 5)):
+        el = box.nth(i)
+        try:
+            if el.is_visible() and (el.get_attribute("type") or "text") != "password":
+                el.fill(term)
+                el.press("Enter")
+                trace.add("documents_searched")
+                return True
+        except Exception:
+            continue
+    return False
+
+
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+_DATE_PATTERNS = [
+    (re.compile(r"\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b"), lambda m: (int(m[1]), int(m[2]))),
+    (re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4}|\d{2})\b"),
+     lambda m: (int(m[3]) + (2000 if len(m[3]) == 2 else 0), int(m[1]))),
+    (re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?[-\s]+(?:\d{1,2}(?:st|nd|rd|th)?[-,\s]+)?(\d{4})\b",
+                re.I), lambda m: (int(m[2]), _MONTHS[m[1][:3].lower()])),
+    (re.compile(r"\bQ([1-4])\s*[-']?\s*(\d{4})\b", re.I), lambda m: (int(m[2]), int(m[1]) * 3)),
+    (re.compile(r"\b(\d{4})\s*Q([1-4])\b", re.I), lambda m: (int(m[1]), int(m[2]) * 3)),
+]
+
+
+def row_quarter(text: str) -> tuple[int, int] | None:
+    """The latest (year, quarter) among the dates in a document row's text."""
+    best = None
+    for pattern, ym in _DATE_PATTERNS:
+        for m in pattern.finditer(text or ""):
+            try:
+                y, mo = ym(m)
+            except Exception:
+                continue
+            if 1990 <= y <= 2100 and 1 <= mo <= 12:
+                q = (y, (mo - 1) // 3 + 1)
+                best = q if best is None or q > best else best
+    return best
+
+
+def row_month(text: str) -> tuple[int, int] | None:
+    """The latest (year, month) among the dates in a document row's text."""
+    best = None
+    for pattern, ym in _DATE_PATTERNS:
+        for m in pattern.finditer(text or ""):
+            try:
+                y, mo = ym(m)
+            except Exception:
+                continue
+            if 1990 <= y <= 2100 and 1 <= mo <= 12:
+                best = (y, mo) if best is None or (y, mo) > best else best
+    return best
+
+
+def latest_rows(texts: list[str], monthly: bool = False) -> tuple[list[int], str]:
+    """Which document rows to download: those dated in the newest quarter shown (several
+    funds' statements for one quarter), or the newest month for a monthly login. With no
+    dates at all, the first row only, since document lists show the newest first.
+    Returns (indexes, how)."""
+    periods = [(row_month if monthly else row_quarter)(t) for t in texts]
+    dated = [q for q in periods if q]
+    if not dated:
+        return ([0] if texts else []), "first listed (no dates found)"
+    top = max(dated)
+    how = f"{top[0]}-{top[1]:02d}" if monthly else f"{top[0]} Q{top[1]}"
+    return [i for i, q in enumerate(periods) if q == top], how
+
+
+def _row_text(el) -> str:
+    """The text of the list row or table row holding a document link."""
+    for xp in ("xpath=ancestor::*[self::tr or self::li or @role='row'][1]",
+               "xpath=..", "xpath=../..", "xpath=../../.."):
+        try:
+            row = el.locator(xp)
+            if row.count():
+                t = row.first.inner_text(timeout=2000)
+                if row_quarter(t) or xp.endswith("../../.."):
+                    return t
+        except Exception:
+            continue
+    return ""
+
+
+def _content_control(page, label: str):
+    """A visible control named `label` in the page content, never in a sidebar or header."""
+    for pattern in (_exact(label), re.compile(re.escape(label.strip()), re.I)):
+        for role in ("tab", "link", "button", "menuitem"):
+            try:
+                loc = page.get_by_role(role, name=pattern)
+                for i in range(min(loc.count(), 8)):
+                    el = loc.nth(i)
+                    if el.is_visible() and not el.evaluate(_IN_NAV):
+                        return el
+            except Exception:
+                continue
+    return None
+
+
+def _wait_for_content_control(holder, label: str, seconds: int, trace):
+    """Wait up to `seconds` for a `label` control in the page content (e.g. a fund page's
+    Documents tab) to show up; then fall back to any `label` control, sidebar included."""
+    holder.deadline += seconds          # waiting for a slow page isn't fetch time
+    start = time.monotonic()
+    while time.monotonic() - start < seconds:
+        holder.check()
+        page = _live_page(holder)
+        el = _content_control(page, label)
+        if el is not None:
+            trace.add("page_ready", waited_s=round(time.monotonic() - start))
+            return el
+        page.wait_for_timeout(1000)
+    trace.add("page_ready_timeout", waited_s=seconds)
+    return _find_control(_live_page(holder), label)
+
+
+def _wait_for_person(holder, login: dict, ctx, domains) -> None:
+    """The portal shows a CAPTCHA. Only a person may answer it: bring the fetcher's window
+    to the front, say so in the Inbox, and wait for the owner to solve it there. Nothing
+    here clicks, types into or otherwise touches the CAPTCHA."""
+    trace = ctx.trace
+    if config.HEADLESS:
+        raise FetchStopped("captcha", _sign_in_by_hand(
+            login, "The portal is showing a CAPTCHA, and the browser window is hidden."))
+    page = holder.page
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+    item = store.add_inbox_item(
+        ctx.conn, "question", f"{login['name']}: the portal is showing a CAPTCHA. Solve it in "
+        f"the browser window that just opened; the run carries on by itself once it's gone "
+        f"(waiting up to {config.CAPTCHA_WAIT_S // 60} minutes).",
+        institution=login["institution"], account=login["name"], login_id=login["id"],
+        payload={"stop": "captcha_wait"})
+    trace.add("captcha_waiting_for_you")
+    holder.deadline += config.CAPTCHA_WAIT_S      # waiting for you doesn't count as fetch time
+    end = time.monotonic() + config.CAPTCHA_WAIT_S
+    try:
+        while time.monotonic() < end:
+            holder.check()
+            page = _live_page(holder)
+            page.wait_for_timeout(2000)
+            if _classify(page, domains) != "captcha":
+                trace.add("captcha_solved_by_you")
+                _settle(page)
+                return
+        raise FetchStopped("captcha", f"The CAPTCHA wasn't solved within "
+                           f"{config.CAPTCHA_WAIT_S // 60} minutes. Refresh again when you're "
+                           "at the computer.")
+    finally:
+        store.resolve_inbox_item(ctx.conn, item, "expired")
+
+
+def _fetch_documents(holder, context, login, steps, domains, trace, ctx=None) -> list[dict]:
+    """Open the documents tab, filter or search for the capital account statements, and
+    download the latest ones (from the allowed domains only). Returns [{"name", "data"}];
+    reading happens later."""
+    tab = steps.get("documents_tab") or "Documents"
+    wanted = "Capital Account Statements"     # used when the page offers that filter
+    page = holder.page
+    if tab.lower().startswith("https://"):     # the documents page's own address
+        if not host_allowed(tab, domains):
+            raise FetchStopped("blocked_click", "The documents page's address isn't on this "
+                               "login's own site, so it wasn't opened.")
+        _settled_url(page)                      # let sign-in finish its redirects
+        trace.add("goto_documents", url=tab)
+        page.goto(tab, timeout=30000)
+        trace.add("opened", what="the documents page", url=_settled_url(page))
+        _settle(page)
+        tab = "documents"
+    else:
+        el = _find_control(page, tab)
+        if el is None:
+            raise FetchStopped("not_found", f"Couldn't find the {tab!r} tab after signing in. "
+                               "Set the documents tab's label on this login (login steps).")
+        _click_and_wait(page, el, domains, trace, "the documents tab")
+    holder.check()
+    page = holder.page
+    if _classify(page, domains) == "captcha":
+        _wait_for_person(holder, login, ctx, domains)
+        page = holder.page
+    if not (_apply_filter(page, wanted, domains, trace) or _search(page, wanted, trace)):
+        trace.add("documents_unfiltered")     # no filter set and none shown: the whole list
+    _settle(page)
+    page.wait_for_timeout(1500)
+    holder.check()
+    if _classify(page, domains) == "captcha":
+        _wait_for_person(holder, login, ctx, domains)
+        page = holder.page
+    found = []
+    for _ in range(10):                 # the list can fill in after the page loads
+        found = _column_links(page, "Download")
+        if found:                       # icons under a "Download" heading, one per row
+            trace.add("documents_by_column")
+            break
+        found = _download_links(page)
+        if found:
+            break
+        page.wait_for_timeout(1000)
+        holder.check()
+    targets, rows, tried = [], [], set()
+    for el in found:          # one entry per visible link (two searches can find the same)
+        try:
+            if not el.is_visible():
+                continue
+            key = el.get_attribute("href") or ""
+            if not key or key.lower().startswith(("javascript:", "#")):   # same for every row
+                key = el.evaluate("e => e.outerHTML")[:300]
+        except Exception:
+            continue
+        if key in tried:
+            continue
+        tried.add(key)
+        targets.append(el)
+        rows.append(_row_text(el))
+    picked, how = latest_rows(rows, monthly=login.get("cadence") == "monthly")
+    trace.add("documents_listed", count=len(targets), picked=len(picked), latest=how)
+    docs, seen = [], set()
+    for i in picked[:config.MAX_DOCUMENTS]:
+        holder.check()
+        doc = _download(holder, context, targets[i], page, domains, trace)
+        if doc and doc["data"][:64] not in seen:
+            seen.add(doc["data"][:64])
+            docs.append(doc)
+    trace.add("documents_downloaded", count=len(docs))
+    if not docs:
+        raise FetchStopped("not_found", f"The {tab!r} page had no statement that could be downloaded"
+                           f" ({len(targets)} download links found).")
+    return docs
+
+
+# In each body row of a table, the clickable thing in the cell under `heading` (e.g. an
+# icon-only "Download" column). Marks them with data-pa-dl so Playwright can find them.
+# A page-wide button with the same label (used with checkboxes) is never in a row cell.
+COLUMN_LINKS_JS = r"""(heading) => {
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const want = clean(heading);
+  document.querySelectorAll('[data-pa-dl]').forEach(e => e.removeAttribute('data-pa-dl'));
+  let n = 0;
+  for (const table of document.querySelectorAll('table')) {
+    const head = [...table.querySelectorAll('th, thead td')].find(c => clean(c.innerText) === want);
+    if (!head) continue;
+    const idx = [...head.parentElement.children].indexOf(head);
+    for (const row of table.querySelectorAll('tr')) {
+      if (row === head.parentElement || row.closest('thead')) continue;
+      const cell = row.children[idx];
+      if (!cell) continue;
+      const el = cell.querySelector('a, button, [role=button], [onclick], input[type=image]')
+              || cell.querySelector('i, svg, img, span');
+      if (!el || !(el.offsetWidth || el.offsetHeight || el.getClientRects().length)) continue;
+      el.setAttribute('data-pa-dl', String(n++));
+    }
+    if (n) break;
+  }
+  return n;
+}"""
+
+
+def _column_links(page, heading: str) -> list:
+    try:
+        n = page.evaluate(COLUMN_LINKS_JS, heading)
+    except Exception:
+        return []
+    return [page.locator(f"[data-pa-dl='{i}']") for i in range(min(n, config.MAX_DOCUMENTS * 4))]
+
+
+def _download_links(page) -> list:
+    found = []
+    for role in ("link", "button"):
+        loc = page.get_by_role(role, name=DOWNLOAD_NAME)
+        found += [loc.nth(i) for i in range(min(loc.count(), config.MAX_DOCUMENTS * 4))]
+    loc = page.locator("a[href$='.pdf' i], a[href*='.pdf?' i], a[download]")
+    found += [loc.nth(i) for i in range(min(loc.count(), config.MAX_DOCUMENTS * 4))]
+    return found
+
+
+def _path(url: str) -> str:
+    return url.split("#")[0].split("?")[0].rstrip("/").lower()
+
+
+def _settled_url(page, quiet_s: float = 2.0, timeout_s: float = 15.0) -> str:
+    """Wait until the page has loaded and its address has stayed the same for a moment
+    (a portal can still be redirecting after sign-in). Returns the address."""
+    deadline = time.monotonic() + timeout_s
+    last, since = page.url, time.monotonic()
+    while time.monotonic() < deadline:
+        try:
+            page.wait_for_load_state("load", timeout=5000)
+        except Exception:
+            pass
+        if page.url != last:
+            last, since = page.url, time.monotonic()
+        elif time.monotonic() - since >= quiet_s:
+            break
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+    return page.url
+
+
+def _click_and_wait(page, el, domains, trace, what: str) -> None:
+    """Click a tab or menu link and wait for what it opens. A link to another page (an
+    older portal that loads a whole new page) is followed until the browser is on that
+    page and it has loaded; "network quiet" alone can pass before the new page starts.
+    If the portal ends up elsewhere (e.g. sent back to the page before), the link's own
+    address (checked like any click, same site only) is opened directly."""
+    _settled_url(page)                  # don't click while sign-in is still redirecting
+    start = page.url.split("#")[0]
+
+    def link_target() -> str:
+        """The link's address, or "" while it has none or points back at this page
+        (some portals fill in a menu link's address with a script after loading)."""
+        href = ""
+        for read in (lambda: el.evaluate("e => (e.closest('a[href]') || e).href || ''",
+                                         timeout=5000),
+                     lambda: urljoin(page.url, el.get_attribute("href", timeout=5000) or "")):
+            try:
+                href = read() or ""
+            except Exception:
+                href = ""
+            if href:
+                break
+        href = href.split("#")[0]
+        if not href.lower().startswith(("http://", "https://")) or href == start:
+            return ""
+        return href
+
+    target = link_target()
+    try:
+        is_link = bool(el.evaluate("e => !!e.closest('a')", timeout=5000))
+    except Exception:
+        is_link = False
+    deadline = time.monotonic() + 15
+    while is_link and not target and time.monotonic() < deadline:   # wait for its address
+        page.wait_for_timeout(500)
+        target = link_target()
+    trace.add("link_target", what=what, url=target or "(none)")
+    _safe_click(el, page, domains, trace, what)
+    if target:
+        try:
+            page.wait_for_url(lambda u: u.split("#")[0] != start, timeout=20000)
+        except Exception:
+            pass
+    else:
+        try:
+            page.wait_for_load_state("load", timeout=20000)
+        except Exception:
+            pass
+    landed = _settled_url(page)
+    trace.add("opened", what=what, url=landed)
+    if landed.split("#")[0] == start:            # still where it was: the click did nothing
+        target = target or link_target()
+        if target and host_allowed(target, domains):
+            trace.add("followed_link", what=what)
+            page.goto(target, timeout=30000)
+            trace.add("opened", what=what, url=_settled_url(page))
+    elif target and _path(landed) != _path(target) and host_allowed(target, domains):
+        trace.add("followed_link", what=what)      # sent somewhere else: open the link
+        page.goto(target, timeout=30000)
+        trace.add("opened", what=what, url=_settled_url(page))
+    _settle(page)
+
+
+def _download(holder, context, el, page, domains, trace) -> dict | None:
+    """Click one document link: a file download, or a PDF opened in a new tab."""
+    try:                       # a link to another site, or a risky label: skip, never click
+        label = (el.inner_text(timeout=2000) or "")[:80]
+        href = el.get_attribute("href") or ""
+    except Exception:
+        return None
+    if check_click(label, urljoin(page.url, href) if href else "", page.url, domains):
+        trace.add("download_refused", reason="link outside the allowed domains or not allowed")
+        return None
+    before, start_url = set(context.pages), page.url
+    try:
+        with page.expect_download(timeout=20000) as info:
+            el.click(timeout=15000)
+            trace.add("click", what="a statement")
+        d = info.value
+        if not host_allowed(d.url, domains):
+            trace.add("download_refused", reason="outside the allowed domains")
+            return None
+        with open(d.path(), "rb") as f:
+            data = f.read()
+        name = d.suggested_filename or "statement.pdf"
+    except FetchStopped:
+        raise
+    except Exception:
+        new = [p for p in context.pages if p not in before]
+        if not new and page.url != start_url and host_allowed(page.url, domains):
+            try:                   # the PDF opened in the same tab: fetch it, then go back
+                r = context.request.get(page.url, timeout=30000)
+                data, name = r.body(), page.url.rsplit("/", 1)[-1].split("?")[0]
+                page.go_back(timeout=20000)
+                _settle(page)
+            except Exception:
+                return None
+            if not data.startswith(b"%PDF-"):
+                return None
+            trace.add("document_downloaded")
+            return {"name": (name or "statement") + ("" if name.lower().endswith(".pdf") else ".pdf"),
+                    "data": data}
+        if not new:
+            return None
+        tab = new[-1]
+        try:
+            tab.wait_for_load_state("load", timeout=20000)
+            url = tab.url
+            if not host_allowed(url, domains):
+                trace.add("download_refused", reason="outside the allowed domains")
+                return None
+            r = context.request.get(url, timeout=30000)
+            data, name = r.body(), url.rsplit("/", 1)[-1].split("?")[0] or "statement.pdf"
+        except Exception:
+            return None
+        finally:
+            try:
+                tab.close()
+            except Exception:
+                pass
+            holder.page = page
+    if not data.startswith(b"%PDF-"):
+        trace.add("download_skipped", reason="not a PDF")
+        return None
+    trace.add("document_downloaded")       # never the file name: it may hold a number
+    return {"name": name if name.lower().endswith(".pdf") else name + ".pdf", "data": data}
+
+
+FUND_PICK_SYSTEM = ("You pick links on an investor portal's dashboard. Reply with JSON only: "
+                    '{"ids": [numbers]} listing the links whose text is the name of a fund or '
+                    "investment the investor holds. Never settings, documents, profile, help, "
+                    "logout, transfer or navigation links.")
+
+
+# The texts under a column heading (e.g. "Fund Name"): from a table's header if there is
+# one, else by position: elements left-aligned under the heading, below it.
+COLUMN_JS = r"""(name) => {
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+  const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const want = clean(name).toLowerCase();
+  const heads = [...document.querySelectorAll('th, [role=columnheader], div, span, td, p, b, strong')]
+    .filter(e => vis(e) && clean(e.innerText).toLowerCase() === want);
+  if (!heads.length) return [];
+  const head = heads.sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length)[0];
+  const table = head.closest('table, [role=table], [role=grid]');
+  if (table) {
+    const row = head.closest('tr, [role=row]');
+    const cells = [...row.querySelectorAll('th, td, [role=columnheader], [role=cell], [role=gridcell]')];
+    const idx = cells.indexOf(head.closest('th, td, [role=columnheader]'));
+    if (idx >= 0) {
+      const out = [];
+      table.querySelectorAll(table.matches('table') ? 'tr' : '[role=row]').forEach(r => {
+        if (r === row) return;
+        const cs = r.querySelectorAll('th, td, [role=cell], [role=gridcell], [role=rowheader]');
+        if (cs[idx]) { const t = clean(cs[idx].innerText); if (t) out.push(t); }
+      });
+      if (out.length) return out;
+    }
+  }
+  const h = head.getBoundingClientRect();
+  const out = [];
+  document.querySelectorAll('a, button, td, [role=cell], [role=gridcell], span, div, p').forEach(e => {
+    if (!vis(e) || e.contains(head)) return;
+    const r = e.getBoundingClientRect();
+    if (r.top < h.bottom - 2 || Math.abs(r.left - h.left) > 12) return;
+    if ([...e.children].some(c => clean(c.innerText) === clean(e.innerText))) return;  // inner one
+    const t = clean(e.innerText);
+    if (t && t.length <= 120 && t.toLowerCase() !== want && !out.includes(t)) out.push(t);
+  });
+  return out.slice(0, 40);
+}"""
+
+
+def _wait_after_login(holder, steps, trace) -> None:
+    """Some portals keep loading their data well after sign-in: wait the login's set
+    number of seconds, one second at a time so Cancel and the kill switch still work."""
+    try:
+        seconds = int(steps.get("post_login_wait") or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    if seconds <= 0:
+        return
+    trace.add("wait_after_login", seconds=seconds)
+    holder.deadline += seconds          # waiting doesn't count as fetch time
+    for _ in range(min(seconds, 180)):
+        holder.check()
+        holder.page.wait_for_timeout(1000)
+    _settle(holder.page)
+
+
+def _fund_links(page, steps, ctx, trace) -> list[str]:
+    """Names of the funds on the dashboard: the cells under the login's fund column (e.g.
+    "Fund Name"), else the ones the local model picks from the link names (names only)."""
+    column = (steps.get("fund_column") or "").strip()
+    if column:
+        try:
+            names = page.evaluate(COLUMN_JS, column)
+        except Exception:
+            names = []
+        names = [n for n in dict.fromkeys(names)
+                 if not re.match(r"^total\b", n, re.I) and not check_click(n, "", page.url, [])]
+        trace.add("fund_links_found", count=len(names), how="column")
+        if not names:
+            raise FetchStopped("not_found", f"Couldn't find a {column!r} column with fund names "
+                               "on the dashboard.")
+        return names[:20]
+    items = page.evaluate(_CLICKABLES_JS)
+    labels = [(c["id"], " ".join((c.get("label") or "").split())) for c in items]
+    labels = [(i, l) for i, l in labels if 2 < len(l) <= 120]
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from ..jsonutil import extract_json
+    listing = "\n".join(f"[{i}] {l}" for i, l in labels[:150])
+    reply = ctx.model_loader().invoke([SystemMessage(FUND_PICK_SYSTEM),
+                                       HumanMessage(f"Links:\n{listing}")]).content
+    try:
+        ids = {int(x) for x in extract_json(reply).get("ids", [])}
+    except Exception:
+        ids = set()
+    names = [l for i, l in labels if i in ids]
+    names = [n for n in dict.fromkeys(names) if not check_click(n, "", page.url, [])]
+    trace.add("fund_links_found", count=len(names), how="model")
+    return names[:20]
+
+
+PDF_ICON = ("a[href*='.pdf' i], a:has(img[src*='pdf' i]), a:has([class*='pdf' i]), "
+            "[class*='pdf' i], img[src*='pdf' i], [title*='pdf' i], [aria-label*='pdf' i], "
+            "a:has(img), a:has(i), a:has(svg)")
+
+
+def _pdf_target(row):
+    """In a document's row, the thing to click to get the file: its PDF icon, else the
+    row's first link. None if the row has neither (then the matched text is clicked)."""
+    for sel in (PDF_ICON, "a"):
+        try:
+            loc = row.locator(sel)
+            for i in range(min(loc.count(), 6)):
+                if loc.nth(i).is_visible():
+                    return loc.nth(i)
+        except Exception:
+            continue
+    return None
+
+
+MENU_BUTTON = re.compile(r"^\s*(select|actions?|more|options|⋮|…|\.\.\.)\s*$", re.I)
+MENU_CHOICE = re.compile(r"^\s*(download( pdf| file| document)?|view( pdf| document)?|open)\s*$", re.I)
+
+
+def _expect_file(holder, context, page, domains, trace, click) -> dict | None:
+    """Run `click` and catch the file it produces: a download, a PDF in a new tab, or a
+    PDF opened in the same tab."""
+    before, start_url = set(context.pages), page.url
+    data = name = None
+    try:
+        with page.expect_download(timeout=25000) as info:
+            click()
+        d = info.value
+        if not host_allowed(d.url, domains) and not d.url.startswith(("blob:", "data:")):
+            trace.add("download_refused", reason="outside the allowed domains")
+            return None
+        with open(d.path(), "rb") as f:
+            data = f.read()
+        name = d.suggested_filename or "statement.pdf"
+    except FetchStopped:
+        raise
+    except Exception:
+        page.wait_for_timeout(3000)
+        new = [p for p in context.pages if p not in before]
+        url = new[-1].url if new else (page.url if page.url != start_url else None)
+        if not url or not host_allowed(url, domains):
+            return None
+        try:
+            r = context.request.get(url, timeout=30000)
+            data, name = r.body(), url.rsplit("/", 1)[-1].split("?")[0] or "statement"
+        except Exception:
+            return None
+        finally:
+            for p in new:
+                try:
+                    p.close()
+                except Exception:
+                    pass
+            holder.page = page
+            if not new:
+                try:
+                    page.go_back(timeout=20000)
+                except Exception:
+                    pass
+    if not data or not data.startswith(b"%PDF-"):
+        trace.add("download_skipped", reason="not a PDF")
+        return None
+    trace.add("document_downloaded")
+    return {"name": name if name.lower().endswith(".pdf") else name + ".pdf", "data": data}
+
+
+def _download_via_menu(holder, context, row, page, domains, trace) -> dict | None:
+    """The row's actions menu ("Select"), then its Download (or View) choice."""
+    try:
+        btn = row.get_by_role("button", name=MENU_BUTTON)
+        if not btn.count():
+            btn = row.get_by_text(MENU_BUTTON)
+        if not btn.count() or not btn.first.is_visible():
+            return None
+        btn.first.click(timeout=10000)
+        trace.add("click", what="the row's actions menu")
+        page.wait_for_timeout(800)
+        choice = None
+        for role in ("menuitem", "link", "button", "option"):
+            loc = page.get_by_role(role, name=MENU_CHOICE)
+            for i in range(min(loc.count(), 6)):
+                if loc.nth(i).is_visible():
+                    choice = loc.nth(i)
+                    break
+            if choice is not None:
+                break
+        if choice is None:
+            page.keyboard.press("Escape")
+            return None
+        label = (choice.inner_text(timeout=2000) or "")[:40]
+        href = choice.get_attribute("href") or ""
+        if check_click(label, urljoin(page.url, href) if href else "", page.url, domains):
+            page.keyboard.press("Escape")
+            return None
+        trace.add("download_via", how="menu")
+        return _expect_file(holder, context, page, domains, trace,
+                            lambda: choice.click(timeout=10000))
+    except FetchStopped:
+        raise
+    except Exception:
+        return None
+
+
+def _download_via_checkbox(holder, context, row, page, domains, trace) -> dict | None:
+    """Tick the row's checkbox and press the page's Download button (a PDF only)."""
+    try:
+        box = row.locator("input[type=checkbox]").first
+        if not box.count() or not box.is_visible():
+            return None
+        button = _content_control(page, "Download")
+        if button is None:
+            return None
+        box.check(timeout=5000)
+        trace.add("download_via", how="checkbox")
+        doc = _expect_file(holder, context, page, domains, trace,
+                           lambda: button.click(timeout=10000))
+        try:
+            box.uncheck(timeout=5000)
+        except Exception:
+            pass
+        return doc
+    except FetchStopped:
+        raise
+    except Exception:
+        return None
+
+
+def _fetch_fund_documents(holder, context, login, steps, domains, trace, ctx) -> list[dict]:
+    """For each fund on the dashboard: open it, open its documents tab, wait for the list,
+    and download the latest file whose name contains the login's document name."""
+    tab = steps.get("documents_tab") or "Documents"
+    wanted = steps["document_name"]
+    home = holder.page.url
+    if _classify(holder.page, domains) == "captcha":
+        _wait_for_person(holder, login, ctx, domains)
+    funds = _fund_links(holder.page, steps, ctx, trace)
+    if not funds:
+        raise FetchStopped("not_found", "Couldn't tell which links on the dashboard are funds. "
+                           "Set the heading of the fund-name column on this login (login steps).")
+    docs, seen = [], set()
+    for n, fund in enumerate(funds, 1):
+        holder.check()
+        if n > 1:
+            _PageAdapter(holder).goto(home)
+        page = holder.page
+        el = _find_control(page, fund, ("link", "button", "tab", "menuitem", "row", "cell",
+                                        "gridcell"))
+        if el is None:                   # a plain text cell: click the text itself
+            try:
+                loc = page.get_by_text(fund, exact=True)
+                el = next((loc.nth(i) for i in range(min(loc.count(), 5))
+                           if loc.nth(i).is_visible()), None)
+            except Exception:
+                el = None
+        if el is None:
+            trace.add("fund_not_found", n=n)
+            continue
+        try:                      # a table cell holding the name: click the link in it
+            inner = el.locator("a")
+            if inner.count() and inner.first.is_visible():
+                el = inner.first
+        except Exception:
+            pass
+        _safe_click(el, page, domains, trace, f"fund {n}")
+        _settle(page)
+        holder.check()
+        # the fund page can load slowly: wait for its own Documents tab (not the sidebar's)
+        t = _wait_for_content_control(holder, tab, max(60, int(steps.get("post_login_wait") or 0)),
+                                      trace)
+        page = holder.page
+        if t is None:
+            trace.add("fund_documents_tab_missing", n=n, url_changed=page.url != home)
+            continue
+        _safe_click(t, page, domains, trace, "the documents tab")
+        _settle(page)
+        try:                      # the document list loads after the tab opens
+            page.get_by_text(re.compile(re.escape(wanted), re.I)).first.wait_for(timeout=30000)
+        except Exception:
+            trace.add("fund_documents_none", n=n)
+            continue
+        if _classify(page, domains) == "captcha":
+            _wait_for_person(holder, login, ctx, domains)
+            page = holder.page
+        found = []
+        name_re = re.compile(re.escape(wanted), re.I)
+        for role in ("link", "button", "row", "cell"):
+            loc = page.get_by_role(role, name=name_re)
+            found += [loc.nth(i) for i in range(min(loc.count(), 40))]
+        loc = page.get_by_text(name_re)
+        found += [loc.nth(i) for i in range(min(loc.count(), 40))]
+        targets, rows, row_els, tried = [], [], [], set()
+        for el in found:          # one entry per document row
+            try:
+                if not el.is_visible():
+                    continue
+                row = el.locator("xpath=ancestor-or-self::*[self::tr or @role='row'][1]")
+                row = row.first if row.count() else el
+                key = row.evaluate("e => e.outerHTML")[:500]
+            except Exception:
+                continue
+            if key in tried:
+                continue
+            tried.add(key)
+            targets.append(_pdf_target(row) or el)
+            row_els.append(row)
+            try:
+                rows.append(row.inner_text(timeout=2000))
+            except Exception:
+                rows.append(_row_text(el))
+        picked, how = latest_rows(rows)
+        trace.add("fund_documents_listed", n=n, count=len(targets), picked=len(picked[:1]),
+                  latest=how)
+        for i in picked[:1]:      # one capital statement per fund: the latest
+            doc = (_download(holder, context, targets[i], page, domains, trace)
+                   or _download_via_menu(holder, context, row_els[i], page, domains, trace)
+                   or _download_via_checkbox(holder, context, row_els[i], page, domains, trace))
+            if doc and doc["data"][:64] not in seen:
+                seen.add(doc["data"][:64])
+                docs.append(doc)
+    trace.add("documents_downloaded", count=len(docs))
+    if not docs:
+        raise FetchStopped("not_found", f"Opened {len(funds)} fund(s) but found no file named "
+                           f"like {wanted!r} that could be downloaded.")
+    return docs
+
+
+PROFILE_IN_USE = re.compile(r"existing browser session|profile is already in use|ProcessSingleton",
+                            re.I)
+
+
+def profile_busy_message(login: dict) -> str:
+    """A browser window already has this institution's profile open, usually the window
+    from open-browser. Only one window can use a profile at a time."""
+    return (f"The browser window for {login['institution']} is still open (for example the "
+            "one from open-browser), and only one window can use its saved sign-in at a time. "
+            "Finish signing in there, close that window, then Refresh again.")
+
+
 def _top_level(request) -> bool:
     """Is this navigation for a whole page? A new window's (popup's) first navigation
     has no frame yet: it is a whole page too, so it is checked like one."""
@@ -278,8 +1179,7 @@ def _frames(page, domains: list[str] | None):
 
 def _login_scope(page, domains: list[str] | None, steps: dict):
     """The page or allowed frame holding the login form (password or username field)."""
-    pw_sel = steps.get("password_selector") or "input[type=password]"
-    sels = [pw_sel, USERNAME_FIELDS] + ([steps["username_selector"]] if steps.get("username_selector") else [])
+    sels = ["input[type=password]", USERNAME_FIELDS]
     for scope in _frames(page, domains):
         if any(_visible(scope.locator(sel)) for sel in sels):
             return scope
@@ -287,12 +1187,9 @@ def _login_scope(page, domains: list[str] | None, steps: dict):
 
 
 def _find_username(page, steps: dict):
-    """The username field, or None. Saved selector first, then common names, then
-    the text field in the same form as the password. `page` may be a frame."""
-    candidates = []
-    if steps.get("username_selector"):
-        candidates.append(page.locator(steps["username_selector"]))
-    candidates.append(page.locator(USERNAME_FIELDS))
+    """The username field, or None: common names first, then the text field in the
+    same form as the password. `page` may be a frame."""
+    candidates = [page.locator(USERNAME_FIELDS)]
     pw = page.locator("input[type=password]")
     if _visible(pw):
         candidates.append(pw.first.locator("xpath=ancestor::form[1]").locator(USERNAME_IN_FORM))
@@ -316,12 +1213,9 @@ SUBMIT_BUTTONS = ("button[type=submit], input[type=submit], button:has-text('Con
 
 
 def _submit(page, field, steps: dict, scope=None) -> None:
-    """Submit the login step: saved button, else Enter, else the step's sign-in button.
-    scope is the frame holding the form, when it's in one."""
+    """Submit the login step: Enter, else the step's sign-in button. scope is the frame
+    holding the form, when it's in one."""
     scope = scope or page
-    if steps.get("submit_selector") and _visible(scope.locator(steps["submit_selector"])):
-        scope.locator(steps["submit_selector"]).first.click(timeout=15000)
-        return
     url = page.url
     field.press("Enter")
     try:
@@ -373,13 +1267,16 @@ def _login(holder: _Holder, login: dict, creds: dict | None, steps: dict,
     counted = False
     for _ in range(5):   # user ID page, password page, then possibly a 2FA page
         state = _classify(page, domains)
+        if state == "twofa" and steps.get("otp_button") and any(   # code box beside the password
+                _visible(f.locator("input[type=password]")) for f in _frames(page, domains)):
+            state = "login"
         trace.add("page_state", state=state, url=page.url)
         if state == "ok":
             return
         if state == "captcha":
-            raise FetchStopped("captcha", "The portal is showing a CAPTCHA. Sign in once by hand "
-                               "with `python -m portfolio_agent.cli open-browser "
-                               f"{login['id']}`, then Refresh again.")
+            _wait_for_person(holder, login, ctx, domains)
+            page = holder.page
+            continue
         if state == "security_question":
             raise FetchStopped("security_question", "The portal asked a security question. "
                                "Answer it by hand with `open-browser`, then Refresh again.")
@@ -398,7 +1295,7 @@ def _login(holder: _Holder, login: dict, creds: dict | None, steps: dict,
         if not host_allowed(page.url, domains):   # never type a password on another site
             raise FetchStopped("login_failed", "The sign-in form isn't on this login's own "
                                "site, so nothing was typed into it.")
-        pw_sel = steps.get("password_selector") or "input[type=password]"
+        pw_sel = "input[type=password]"
         scope = _login_scope(page, domains, steps)
         if scope is not page:
             trace.add("login_form_in_frame", url=scope.url)
@@ -414,8 +1311,8 @@ def _login(holder: _Holder, login: dict, creds: dict | None, steps: dict,
         if not _visible(scope.locator(pw_sel)):
             # Two-step login: submit the user ID, then wait for the password page.
             if user is None:
-                raise FetchStopped("login_failed", "Couldn't find the username or password field. "
-                                   "Add the field selectors under Accounts & logins → login steps.")
+                raise FetchStopped("login_failed", "Couldn't find the username or password field "
+                                   "on the sign-in page.")
             trace.add("submit_username")
             _submit(page, user, steps, scope)
             _settle(page)
@@ -426,16 +1323,19 @@ def _login(holder: _Holder, login: dict, creds: dict | None, steps: dict,
                 continue    # maybe a 2FA, CAPTCHA or other page: classify it next
         pw = scope.locator(pw_sel).first
         pw.fill(creds["password"])
-        trace.add("submit_login")     # values are never traced
-        _submit(page, pw, steps, scope)
-        try:                          # give the portal time to move past the password page
-            pw.wait_for(state="hidden", timeout=20000)
-        except Exception:
-            pass
-        _settle(page)
-        holder.check()
+        if steps.get("otp_button"):   # the form sends its code on request: get it first
+            _code_on_request(holder, login, scope, steps, ctx)
+            page = holder.page
+        else:
+            trace.add("submit_login")     # values are never traced
+            _submit(page, pw, steps, scope)
+        passed = _wait_past_login(holder, domains)   # slow portals: wait for the next page
         page = holder.page
-        if _classify(page, domains) == "login":
+        if passed:
+            _settle(page)
+            holder.check()
+            page = holder.page
+        else:
             message = _login_message(page, domains)
             trace.add("login_rejected", message=message or "(no message shown)")
             raise FetchStopped("login_failed", "The portal is still showing the login form after "
@@ -605,7 +1505,10 @@ def _google_login(holder: _Holder, login: dict, creds: dict | None, ctx: FetchCo
                 if state == "twofa":          # the portal's own code step, after Google
                     _two_factor(holder, login, ctx)
                     continue
-                if state in ("captcha", "security_question"):
+                if state == "captcha":
+                    _wait_for_person(holder, login, ctx, domains)
+                    continue
+                if state == "security_question":
                     raise FetchStopped(state, _sign_in_by_hand(
                         login, "The portal asked for a check only you can answer."))
                 raise FetchStopped("login_failed", "The sign-in page shows no \"Sign in with "
@@ -652,6 +1555,51 @@ def _login_message(page, domains) -> str | None:
         except Exception:
             continue
     return None
+
+
+LOGIN_ERROR = re.compile(r"invalid|incorrect|wrong|expired|failed|does ?n.?t match|not match"
+                         r"|locked|try again|unsuccessful|not recogni[sz]ed", re.I)
+
+
+def _on_login_form(page, domains, start_url: str | None = None) -> bool:
+    """The sign-in form is still showing: a password box, or (while the address hasn't
+    changed) an editable username box. Once the portal has moved to another address
+    with no password box, it's past the form even if that page has a user-ID field."""
+    if any(_visible(f.locator("input[type=password]")) for f in _frames(page, domains)):
+        return True
+    if start_url and page.url.split("#")[0] != start_url.split("#")[0]:
+        return False
+    return _classify(page, domains) == "login"
+
+
+def _wait_past_login(holder: _Holder, domains, timeout_s: float | None = None) -> bool:
+    """After pressing sign-in, wait until the login form is gone. Some portals keep the
+    form (or a spinner over it) on screen for a while, or reload the login page once,
+    before the next page loads. True once past it. False when the form is still there
+    at the deadline, or sooner if the portal shows a sign-in error next to it."""
+    started = time.monotonic()
+    deadline = started + (timeout_s or config.LOGIN_WAIT_S)
+    start_url = holder.page.url
+    while True:
+        holder.check()
+        page = holder.page
+        try:
+            page.wait_for_load_state("load", timeout=5000)
+        except Exception:
+            pass
+        if not _on_login_form(page, domains, start_url):
+            return True
+        now = time.monotonic()
+        if now > deadline:
+            return False
+        if now - started > 8:            # give a status notice time to turn into an error
+            message = _login_message(page, domains)
+            if message and LOGIN_ERROR.search(message):
+                return False
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass    # the page navigated away mid-wait; check again
 
 
 def _wait_for_password(page, domains, pw_sel: str, steps: dict, timeout_s: float = 20):
@@ -727,6 +1675,107 @@ def _request_sms(page, trace: Trace) -> bool:
     return True
 
 
+LOGIN_BUTTON = re.compile(r"^\s*(log ?in|sign ?in|submit|verify|continue)\s*$", re.I)
+
+
+def _code_field(scope):
+    """The box for the code: a code/OTP field, else the one empty visible text box that
+    isn't the username or password."""
+    field = scope.locator(CODE_FIELD_VISIBLE).first
+    if _visible(field):
+        return field
+    boxes = scope.locator("input[type=text]:visible, input[type=tel]:visible, "
+                          "input[type=number]:visible, input:not([type]):visible")
+    empty = []
+    for i in range(min(boxes.count(), 10)):
+        b = boxes.nth(i)
+        try:
+            if not b.input_value():
+                empty.append(b)
+        except Exception:
+            continue
+    return empty[0] if len(empty) == 1 else None
+
+
+def _emailed_code(login: dict, steps: dict, since, ctx: FetchContext) -> tuple[str | None, str]:
+    """Read an emailed code from Gmail (when set up), from the login's own domains or its
+    code sender. Returns (code, why not). The code is never traced."""
+    from .. import email_codes
+    settings = email_codes.get_settings(ctx.conn)
+    if not settings:
+        return None, ("Reading codes from Gmail isn't set up (Accounts & logins → Verification "
+                      "codes by email). ")
+    senders = [x for x in re.split(r"[,\s]+", steps.get("code_sender") or "") if x] \
+        or registry.domains(login)
+    with email_codes.EMAIL_LOCK:          # one emailed code expected at a time
+        try:
+            code = email_codes.wait_for_code(settings, since, senders, should_stop=lambda:
+                                             config.KILL_FILE.exists() or ctx.should_cancel())
+        except email_codes.EmailUnavailable as e:
+            return None, str(e) + " "
+    if code:
+        ctx.trace.add("email_code_read")
+        return code, ""
+    return None, f"No email with a code arrived within {config.EMAIL_WAIT_S} seconds. "
+
+
+def _code_on_request(holder: _Holder, login: dict, scope, steps: dict,
+                     ctx: FetchContext) -> None:
+    """A sign-in form with a "send code" button (e.g. "Generate New OTP"): with the
+    username and password filled, press it, get the code (sent by email or text), type
+    it into the form's code box, then press the form's sign-in button."""
+    page, trace = holder.page, ctx.trace
+    label = steps["otp_button"]
+    button = None
+    for pattern in (_exact(label), re.compile(re.escape(label.strip()), re.I)):
+        for role in ("button", "link"):
+            loc = scope.get_by_role(role, name=pattern)
+            if _visible(loc):
+                button = loc.first
+                break
+        if button is not None:
+            break
+    if button is None:
+        raise FetchStopped("login_failed", f"Couldn't find the {label!r} button on the sign-in "
+                           "form. Check its label under Accounts & logins → login steps.")
+    from ..timeutil import now as utcnow
+    since = utcnow() - timedelta(seconds=15)     # a little slack for the mail server's clock
+    button.click(timeout=15000)
+    trace.add("code_requested", method=login.get("twofa_method"))
+    field = None
+    for _ in range(30):                 # the code box can appear after the press
+        field = _code_field(scope)
+        if field is not None:
+            break
+        page.wait_for_timeout(1000)
+    if field is None:
+        raise FetchStopped("twofa_unavailable", f"Pressed {label!r}, but no box for the code "
+                           "showed up on the sign-in form.")
+    holder.check()
+    where = "text message" if login.get("twofa_method") == "sms" else "email"
+    code, why = None, ""
+    if where == "email":
+        code, why = _emailed_code(login, steps, since, ctx)
+        holder.check()
+    if not code:
+        code = ctx.request_code(f"{login['institution']} sent a verification code by {where} for "
+                                f"the {login['name']} login. {why}Enter the code you received.")
+    holder.check()
+    if not code:
+        raise FetchStopped("twofa_unavailable", "No verification code was entered in time.")
+    field.fill(code.strip())
+    trace.add("code_entered")           # the code itself is never traced
+    sign_in = scope.get_by_role("button", name=LOGIN_BUTTON)
+    if not _visible(sign_in):
+        sign_in = scope.locator("input[type=submit]:visible")
+    if not _visible(sign_in):
+        raise FetchStopped("login_failed", "Typed the code but couldn't find the sign-in "
+                           "button on the form.")
+    sign_in.first.click(timeout=15000)
+    trace.add("submit_login")
+    holder.check()                      # _login waits for the next page
+
+
 def _two_factor(holder: _Holder, login: dict, ctx: FetchContext) -> None:
     """Get a 2FA code: ask the portal to text it, read it from Messages (code only,
     spec C12), and fall back to asking the user in the inbox with the reason."""
@@ -755,6 +1804,9 @@ def _two_factor(holder: _Holder, login: dict, ctx: FetchContext) -> None:
                         why = f"No text with a code arrived within {config.SMS_WAIT_S} seconds. "
                 except sms.SmsUnavailable as e:
                     why = str(e) + " "
+    elif method == "email":       # the code page is showing: the email may already be in
+        code, why = _emailed_code(login, registry.steps_for(ctx.conn, login["institution"]),
+                                  utcnow() - timedelta(minutes=3), ctx)
     else:
         why = f"Automatic reading of {method} codes isn't built yet. "
     holder.check()        # cancelled (or kill switch) while waiting for a text
@@ -962,9 +2014,60 @@ def _check_login_cap(ctx: FetchContext, login: dict) -> None:
                            f"{config.MAX_LOGINS_PER_NIGHT} per portal per night.")
 
 
+# Tables as rows ("cell | cell"), and values shown in fields and dropdowns (an "As of"
+# date picker, say), which a page's visible text leaves out. Never a password, username,
+# email address or code field.
+STRUCTURE_JS = r"""() => {
+  const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+  const out = [];
+  document.querySelectorAll('table, [role=table], [role=grid], [role=treegrid]').forEach((t, ti) => {
+    if (!vis(t) || t.parentElement.closest('table, [role=table], [role=grid]')) return;
+    const html = t.matches('table');
+    const lines = [];
+    t.querySelectorAll(html ? 'tr' : '[role=row]').forEach(r => {
+      const cells = r.querySelectorAll(html ? 'th, td'
+        : '[role=cell], [role=gridcell], [role=columnheader], [role=rowheader]');
+      const vals = [...cells].map(c => {
+        const text = clean(c.innerText);
+        const tipEl = c.matches('[title]') ? c : c.querySelector('[title]');
+        const tip = clean((tipEl && tipEl.getAttribute('title')) || c.getAttribute('aria-label'));
+        return tip && tip !== text ? (text ? text + ' (' + tip + ')' : tip) : text;
+      });
+      if (vals.some(v => v)) lines.push(vals.join(' | '));
+    });
+    if (lines.length) out.push('=== Table ' + (ti + 1) + ' (one row per line) ===\n' + lines.join('\n'));
+  });
+  const secret = /pass|user|login|email|e-mail|otp|code|pin|ssn|card|account.?num/i;
+  const fields = [];
+  document.querySelectorAll('input, select').forEach(e => {
+    if (!vis(e)) return;
+    const type = (e.type || '').toLowerCase();
+    if (['password', 'hidden', 'checkbox', 'radio', 'submit', 'button', 'file', 'email', 'tel']
+        .includes(type)) return;
+    const lab = e.id && document.querySelector('label[for="' + CSS.escape(e.id) + '"]');
+    const label = clean((lab && lab.innerText) || e.getAttribute('aria-label') || e.placeholder || '');
+    const hint = [e.name, e.id, e.getAttribute('autocomplete'), label].join(' ');
+    if (secret.test(hint)) return;
+    const v = clean(e.tagName === 'SELECT' ? (e.options[e.selectedIndex] || {}).text : e.value);
+    if (v) fields.push((label ? label + ': ' : '') + v);
+  });
+  if (fields.length) out.push('=== Values shown in fields and dropdowns ===\n' + fields.join('\n'));
+  return out.join('\n\n');
+}"""
+
+
+def _structure(page) -> str:
+    try:
+        return page.evaluate(STRUCTURE_JS) or ""
+    except Exception:
+        return ""
+
+
 def _capture_page(page, n: int) -> dict:
     _settle(page)
-    return {"n": n, "url": page.url, "text": _body_text(page),
+    text, extra = _body_text(page), _structure(page)
+    return {"n": n, "url": page.url, "text": text + ("\n\n" + extra if extra else ""),
             "png": page.screenshot(full_page=True), "html": page.content()}
 
 
@@ -975,6 +2078,10 @@ def _failure_evidence(page, login: dict, trace: Trace) -> str | None:
         folder.mkdir(parents=True, exist_ok=True)
         page.screenshot(path=str(folder / "stopped.png"), full_page=True, timeout=15000)
         (folder / "stopped.txt").write_text(_body_text(page), encoding="utf-8")
+        try:                  # the page's structure, to find out why a step failed
+            (folder / "stopped.html").write_text(page.content(), encoding="utf-8")
+        except Exception:
+            pass
         (folder / "meta.json").write_text(json.dumps({"url": page.url, "stopped_at": now_iso()}))
         trace.add("failure_captured", url=page.url)
         return str(folder)
@@ -1019,13 +2126,36 @@ def _save_evidence(pages: list[dict], login: dict, trace: Trace,
                     proposal=proposal, trace=trace.steps, details=details)
 
 
+def browser_profile(login: dict):
+    """(profile folder, Playwright channel). A "Sign in with Google" login runs in the
+    installed Google Chrome (channel "chrome") with its own profile: Google refuses sign-in
+    from the testing build of Chrome, and the two builds can't share a profile."""
+    base = config.BROWSER_PROFILES_DIR / _slug(login["institution"])
+    if login.get("sign_in_with") == "google":
+        if not config.GOOGLE_CHROME_APP.exists():
+            raise FetchStopped("config", "Sign in with Google needs Google Chrome installed "
+                               f"(looked for {config.GOOGLE_CHROME_APP}).")
+        return base.with_name(base.name + "-chrome"), "chrome"
+    return base, None
+
+
 def open_browser_for_manual_login(login: dict) -> None:
     """Open the login's browser profile so the user can sign in by hand once
     (and tick "remember this device"). Nothing is read or saved by the agent."""
     from playwright.sync_api import sync_playwright
 
-    profile = config.BROWSER_PROFILES_DIR / _slug(login["institution"])
+    profile, channel = browser_profile(login)
     profile.mkdir(parents=True, exist_ok=True)
+    if channel == "chrome":
+        # Google's sign-in: an ordinary Chrome window, not one the agent controls. The
+        # owner signs in to Google there; runs later reuse that profile's session.
+        import subprocess
+        print("Opening Google Chrome with this login's own profile (your everyday Chrome is "
+              "not touched). Press 'Sign in with Google', sign in, then quit this Chrome "
+              "window (Cmd+Q).")
+        subprocess.run([str(config.GOOGLE_CHROME_APP), f"--user-data-dir={profile}",
+                        "--no-first-run", "--no-default-browser-check", login["login_url"]])
+        return
     with sync_playwright() as p:
         browser = p.chromium.launch_persistent_context(str(profile), headless=False,
                                                        viewport={"width": 1400, "height": 1000})

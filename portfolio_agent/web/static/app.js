@@ -21,11 +21,21 @@ async function api(path, opts = {}) {
 }
 
 // --- tabs ---------------------------------------------------------------------
-document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => {
-  document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x === b));
-  document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("active", p.id === b.dataset.tab));
-  ({ dashboard: loadDashboard, inbox: loadInbox, accounts: loadAccounts, debug: loadDebug })[b.dataset.tab]();
-}));
+// Each tab has its own address (/dashboard, /inbox, /accounts, /debug), so a reload,
+// a bookmark or the Back button opens the same tab.
+const TABS = ["dashboard", "inbox", "accounts", "debug"];
+function tabFromPath() {
+  const name = location.pathname.replace(/^\/+|\/+$/g, "");
+  return TABS.includes(name) ? name : "dashboard";
+}
+function showTab(name, push) {
+  document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === name));
+  document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("active", p.id === name));
+  if (push && location.pathname !== "/" + name) history.pushState({ tab: name }, "", "/" + name);
+  ({ dashboard: loadDashboard, inbox: loadInbox, accounts: loadAccounts, debug: loadDebug })[name]();
+}
+document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab, true)));
+window.addEventListener("popstate", () => showTab(tabFromPath(), false));
 
 // --- dashboard ----------------------------------------------------------------
 let chart;
@@ -413,22 +423,47 @@ async function loadInbox() {
 
 // --- accounts & logins --------------------------------------------------------
 let editing = null;     // login id being edited
-const TYPES = ["brokerage", "retirement", "wealth_management", "private_fund", "bank", "loan", "credit_card", "other"];
+const TYPES = ["brokerage", "retirement", "private_fund", "bank", "loan", "credit_card"];
 const STATUSES = [["active", "Included"], ["ignored", "Excluded"], ["pending", "Not decided yet"], ["closed", "Closed"]];
+
+// --- Gmail reader for emailed verification codes ----------------------------------
+async function loadEmailReader() {
+  const r = await api("/api/email-reader");
+  $("#email-reader-status").textContent = r.configured
+    ? `Reading codes from ${r.address}.` : "Not set up: emailed codes are asked for in the Inbox.";
+  $("#email-reader-remove").hidden = !r.configured;
+}
+$("#email-reader-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target, status = $("#email-reader-status");
+  status.textContent = "Checking the Gmail sign-in…";
+  try {
+    await api("/api/email-reader", { method: "PUT",
+      body: { address: f.address.value, app_password: f.app_password.value } });
+    f.reset();
+  } catch (err) { status.textContent = err.message; return; }
+  loadEmailReader();
+});
+$("#email-reader-remove").addEventListener("click", async () => {
+  if (!confirm("Stop reading codes from Gmail? The saved app password is deleted.")) return;
+  await api("/api/email-reader", { method: "DELETE" });
+  loadEmailReader();
+});
 
 async function loadAccounts() {
   loadOwners();
+  loadEmailReader();
   const logins = await api("/api/logins");
   const tb = $("#login-list tbody"); tb.innerHTML = "";
   for (const lg of logins) {
     const tr = document.createElement("tr");
-    const canRefresh = lg.status === "active" && lg.access_method === "browser";
-    const canUpload = lg.status === "active" && lg.access_method === "upload";
+    const canRefresh = lg.status === "active" && lg.refresh_supported;
+    const canUpload = lg.status === "active";
     tr.innerHTML = `<td class="clip" title="${esc(lg.name)}">${esc(lg.name)}</td><td class="clip" title="${esc(lg.institution)}">${esc(lg.institution)}</td><td>${lg.accounts.length}</td>
       <td>${esc(lg.cadence)}</td><td>${lg.has_credentials ? "yes" : "no"}</td>
       <td>${when(lg.last_fetched)}</td>
       <td class="row"><button data-act="edit">Edit</button>
-        ${lg.access_method === "upload"
+        ${!lg.refresh_supported
           ? `<button class="primary" data-act="upload" data-idle="Upload statements" data-lid="${lg.id}" data-can="${canUpload ? 1 : 0}" ${canUpload ? "" : "disabled"} title="Upload this month's statement PDFs: one per account or one consolidated">Upload statements</button><input type="file" accept=".pdf,application/pdf" multiple hidden>`
           : `<button class="primary" data-act="refresh" data-lid="${lg.id}" data-can="${canRefresh ? 1 : 0}" ${canRefresh ? "" : "disabled"}>Refresh</button>`}
         <span class="msg ${loginMsg[lg.id]?.err ? "err" : ""}">${esc(loginMsg[lg.id]?.text || "")}</span></td>`;
@@ -560,7 +595,7 @@ async function uploadStatements(lg, btn, files) {
 
 async function loadStatements(lg) {
   const sec = $("#statements-section");
-  sec.hidden = !(lg && lg.access_method === "upload");
+  sec.hidden = !(lg && (lg.access_method === "upload" || lg.statement_kind === "capital"));
   if (sec.hidden) return;
   const tb = $("#statement-list tbody");
   const ups = await api(`/api/logins/${lg.id}/statements`);
@@ -590,6 +625,7 @@ function openForm(lg) {
     else if (el.name === "holdings_urls") el.value = (lg.holdings_urls || []).join("\n");
     else el.value = lg[el.name] ?? "";
   }
+  syncClosedOn();
   $("#cred-section").hidden = !lg;
   const cf = $("#cred-form"); cf.reset(); cf.password.type = "password"; revealed = false;
   $("#cred-msg").textContent = lg?.has_credentials ? "Saved. Use the eye to view them." : "";
@@ -784,6 +820,14 @@ $("#owner-form").addEventListener("submit", async (e) => {
 });
 
 $("#new-login").addEventListener("click", () => openForm(null));
+// "Closed on" only matters for a closed login.
+function syncClosedOn() {
+  const f = $("#login-form"), closed = f.status.value === "closed";
+  $("#login-closed-on").hidden = !closed;
+  if (!closed) f.closed_on.value = "";
+}
+$("#login-form").status.addEventListener("change", syncClosedOn);
+
 $("#cancel-login").addEventListener("click", () => { $("#login-form-card").hidden = true; editing = null; });
 
 $("#login-form").addEventListener("submit", async (e) => {
@@ -884,7 +928,7 @@ async function showRun(id) {
 }
 
 restoreChartSettings();
-loadDashboard();
+showTab(tabFromPath(), false);   // open the tab named in the address
 setInterval(loadInboxBadge, 15000);
 
 // Resizable columns: drag the right edge of a header; double-click it to reset.

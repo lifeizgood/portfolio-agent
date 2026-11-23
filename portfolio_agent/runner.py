@@ -25,8 +25,27 @@ def select_logins(conn, kind: str, login_ids: list[int] | None = None) -> list[d
     if login_ids:
         return [lg for lg in logins if lg["id"] in login_ids]
     if kind == "refresh":
-        return [lg for lg in logins if lg["holds_public"]]
+        return [lg for lg in logins if lg["refresh_supported"]]
     return [lg for lg in logins if lg["cadence"] == "nightly"]
+
+
+def _read_documents(conn, run_id, login, documents, model_loader, counts, cancelled):
+    """Keep each downloaded statement like an upload (duplicates are recognized), then
+    read the new ones, each as its own run item. Returns the fetch item's outcome."""
+    from .statements import read_one, save_upload
+    new, known = [], 0
+    for d in documents:
+        up = save_upload(conn, login, d["name"], d["data"])
+        if up.get("already_read"):
+            known += 1
+        elif up["id"] not in new:
+            new.append(up["id"])
+    for uid in new:
+        if cancelled():
+            break
+        read_one(conn, run_id, login, uid, model_loader, counts)
+    return "fetched", (f"Downloaded {len(documents)} statement(s): {len(new)} to read, "
+                       f"{known} already read.")
 
 
 def run_logins(conn, kind: str, model_loader: Callable[[], object],
@@ -63,6 +82,11 @@ def run_logins(conn, kind: str, model_loader: Callable[[], object],
             evidence = ev.folder
             if cancelled():       # captured, but not read: nothing from this login is stored
                 raise FetchStopped("cancelled", "Cancelled by you before the pages were read.")
+            if getattr(ev, "documents", None):   # statements downloaded from the portal
+                outcome, detail = _read_documents(conn, run_id, login, ev.documents,
+                                                  model_loader, counts, cancelled)
+                store.finish_run_item(conn, item, outcome, detail, ctx.trace.steps, evidence)
+                continue
             graph = build_ingest_graph(model_loader(), conn)
             out = graph.invoke({"text": ev.text, "evidence": ev.folder, "login": login,
                                 "source": "portal", "run_id": run_id,

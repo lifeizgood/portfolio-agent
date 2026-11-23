@@ -8,7 +8,7 @@ import json
 import stat
 import threading
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -71,6 +71,7 @@ def add_login(conn, **over) -> int:
     return registry.save_login(conn, registry.LoginIn(**{
         "name": "Merrill Lynch", "institution": "Merrill Lynch",
         "login_url": "https://www.mymerrill.com", "allowed_domains": "mymerrill.com, ml.com",
+        "refresh_supported": over.get("access_method", "browser") == "browser",
         **over}))
 
 
@@ -350,7 +351,8 @@ def client(tmp_path):
 
 def test_api_end_to_end(client):
     lg = {"name": "Merrill Lynch", "institution": "Merrill Lynch",
-          "login_url": "https://www.mymerrill.com", "allowed_domains": "mymerrill.com, ml.com"}
+          "login_url": "https://www.mymerrill.com", "allowed_domains": "mymerrill.com, ml.com",
+          "refresh_supported": True}
     assert client.post("/api/logins", json=lg).status_code == 403       # header required
     lid = client.post("/api/logins", json=lg, headers=H).json()["id"]
     assert client.put(f"/api/logins/{lid}/credentials", headers=H,
@@ -414,6 +416,7 @@ def test_account_outside_overall_total_is_kept(conn, tmp_path):
 
 
 def test_account_number_on_page_but_not_extracted_is_caught():
+    from portfolio_agent.schemas import Extraction
     from portfolio_agent.schemas import Extraction
     from portfolio_agent.validator import unlisted_accounts
     text = "Edge Options\n12A-34567\n$100.50\nRoth IRA\n...5678\n$10,000.00\nCall 800-555-0100"
@@ -556,16 +559,17 @@ def test_holding_value_shows_at_its_own_date_and_persists(conn):
 
 
 def test_refresh_one_login_from_accounts_tab(client):
-    mk = lambda n, hp: {"name": n, "institution": n, "login_url": "https://www.mymerrill.com",
-                        "allowed_domains": "mymerrill.com, ml.com", "holds_public": hp}
+    mk = lambda n, rs: {"name": n, "institution": n, "login_url": "https://www.mymerrill.com",
+                        "allowed_domains": "mymerrill.com, ml.com", "refresh_supported": rs}
     a = client.post("/api/logins", json=mk("Merrill Lynch", True), headers=H).json()["id"]
     b = client.post("/api/logins", json=mk("Other Bank", False), headers=H).json()["id"]
-    run = client.post(f"/api/logins/{b}/refresh", headers=H).json()   # not in dashboard Refresh
+    run = client.post(f"/api/logins/{a}/refresh", headers=H).json()
     items = client.get(f"/api/runs/{run['run_id']}").json()["items"]
-    assert [i["login_id"] for i in items] == [b]
-    assert client.get("/api/logins").json()[1]["last_fetched"] is not None
+    assert [i["login_id"] for i in items] == [a]
+    assert client.get("/api/logins").json()[0]["last_fetched"] is not None
+    # Refresh not supported: no Refresh for it; its statements are uploaded instead.
+    assert client.post(f"/api/logins/{b}/refresh", headers=H).status_code == 400
     assert client.post("/api/logins/999/refresh", headers=H).status_code == 404
-    assert a != b
 
 
 # --- login rules: skip duplicates, loans are negative ------------------------------
@@ -611,7 +615,7 @@ def test_skip_rule_ignores_a_duplicate_already_found(conn, tmp_path):
     run_logins(conn, "refresh", lambda: model, fetcher=fake_fetcher(tmp_path))   # no rules yet
     lg = registry.get_login(conn, lid)
     registry.save_login(conn, registry.LoginIn(**{**{k: lg[k] for k in (
-        "name", "institution", "login_url", "allowed_domains")}, "skip_categories": "Investments"}), lid)
+        "name", "institution", "login_url", "allowed_domains", "refresh_supported")}, "skip_categories": "Investments"}), lid)
     model = FakeListChatModel(responses=[json.dumps(later(BOFA_PAGE))])
     run_logins(conn, "refresh", lambda: model, fetcher=fake_fetcher(tmp_path))
     status = {a["portal_name"]: a["status"] for a in registry.get_login(conn, lid)["accounts"]}
@@ -623,7 +627,8 @@ def test_skip_rule_ignores_a_duplicate_already_found(conn, tmp_path):
 
 def test_exclude_new_account_from_inbox_then_reinclude_in_settings(client):
     lg = {"name": "Merrill Lynch", "institution": "Merrill Lynch",
-          "login_url": "https://www.mymerrill.com", "allowed_domains": "mymerrill.com, ml.com"}
+          "login_url": "https://www.mymerrill.com", "allowed_domains": "mymerrill.com, ml.com",
+          "refresh_supported": True}
     client.post("/api/logins", json=lg, headers=H)
     client.post("/api/refresh", headers=H)
     held = {i["account"]: i for i in client.get("/api/inbox").json() if i["kind"] == "held_value"}
@@ -661,7 +666,8 @@ def test_old_code_requests_expire_and_any_can_be_dismissed(conn, client):
 
 def test_debug_lists_runs_and_serves_their_evidence(client, tmp_path):
     lg = {"name": "Merrill Lynch", "institution": "Merrill Lynch",
-          "login_url": "https://www.mymerrill.com", "allowed_domains": "mymerrill.com, ml.com"}
+          "login_url": "https://www.mymerrill.com", "allowed_domains": "mymerrill.com, ml.com",
+          "refresh_supported": True}
     client.post("/api/logins", json=lg, headers=H)
     rid = client.post("/api/refresh", headers=H).json()["run_id"]
     runs = client.get("/api/runs").json()
@@ -710,7 +716,7 @@ def test_debt_counts_negative_even_if_stored_positive(conn):
     assert store.current_positions(conn)[0]["total"] == 700          # not a debt yet
     lg = registry.get_login(conn, lid)
     registry.save_login(conn, registry.LoginIn(**{**{k: lg[k] for k in (
-        "name", "institution", "login_url", "allowed_domains")},
+        "name", "institution", "login_url", "allowed_domains", "refresh_supported")},
         "liability_categories": "Loans, Credit cards"}), lid)          # rule applied to old accounts
     assert registry.get_account(conn, card["id"])["is_liability"]
     p = store.current_positions(conn)[0]
@@ -733,7 +739,7 @@ def test_skip_rule_excludes_existing_accounts_when_saved(conn):
     registry.activate_account(conn, a["id"])
     lg = registry.get_login(conn, lid)
     registry.save_login(conn, registry.LoginIn(**{**{k: lg[k] for k in (
-        "name", "institution", "login_url", "allowed_domains")}, "skip_categories": "Investments"}), lid)
+        "name", "institution", "login_url", "allowed_domains", "refresh_supported")}, "skip_categories": "Investments"}), lid)
     assert registry.get_account(conn, a["id"])["status"] == "ignored"
 
 
@@ -794,7 +800,7 @@ def test_refreshes_run_in_parallel_one_per_institution(tmp_path):
     def mk(name, inst, domain):
         return c.post("/api/logins", headers=H, json={
             "name": name, "institution": inst, "login_url": f"https://www.{domain}",
-            "allowed_domains": domain}).json()["id"]
+            "allowed_domains": domain, "refresh_supported": True}).json()["id"]
 
     bofa = mk("Bank of America", "Bank of America", "bankofamerica.com")
     bofa2 = mk("BofA business", "Bank of America", "bankofamerica.com")
@@ -1551,3 +1557,494 @@ def test_only_a_missing_number_can_be_accepted(conn):
                                 payload={"extraction": {"accounts": []}}, login_id=1)
     with pytest.raises(ValueError):
         accept_review(conn, rid)
+
+
+# --- capital account statements (private funds): one holding, the ending capital ---------
+
+CAPITAL_PDF = make_pdf(["Example Ventures Fund III, L.P.", "Capital Account Statement",
+                        "For the quarter ended September 30, 2026", "Issued November 15, 2026",
+                        "Investor: Alex Sample Trust", "Beginning capital 100,000",
+                        "Contributions 10,000", "Distributions (5,000)", "Net gain 3,000",
+                        "Ending capital 108,000", "Unfunded commitment 40,000"])
+
+
+def test_capital_statement_is_one_holding_dated_by_period_end(tmp_path, monkeypatch):
+    from portfolio_agent.statements import read_uploads, save_upload
+    monkeypatch.setattr(config, "STATEMENTS_DIR", tmp_path / "statements")
+    seen = []
+
+    class Model:
+        def invoke(self, messages):
+            seen.append(messages[1].content)
+            return FakeListChatModel(responses=[json.dumps({
+                "as_of": "2026-09-30", "accounts": [{
+                    "account": "Example Ventures Fund III", "statement_total": 108000.0,
+                    "holdings": [{"description": "Example Ventures Fund III",
+                                  "value": 108000.0}]}]})]).invoke(messages)
+
+    c = store.connect(":memory:")
+    lid = add_login(c, name="Example Ventures", institution="Example Ventures",
+                    access_method="upload", cadence="quarterly", statement_kind="capital",
+                    login_url=None, allowed_domains=None)
+    lg = registry.get_login(c, lid)
+    assert lg["statement_kind"] == "capital"
+    up = save_upload(c, lg, "q3.pdf", CAPITAL_PDF)
+    read_uploads(c, store.start_run(c, "upload"), lg, [up["id"]], lambda: Model())
+    assert "CAPITAL ACCOUNT STATEMENT" in seen[0] and "Unfunded" in seen[0]
+    outcome, detail = c.execute("SELECT outcome, detail FROM run_items").fetchone()
+    assert outcome == "held", detail                     # a new fund waits for approval
+    acct = registry.get_login(c, lid)["accounts"][0]
+    assert acct["account_type"] == "private_fund"
+    item = store.open_review_items(c)[0]
+    s = item["payload"]["snapshot"]
+    assert s["as_of_datetime"].startswith("2026-09-30") and len(s["holdings"]) == 1
+    assert s["holdings"][0]["value"] == 108000.0
+
+
+def test_account_statements_keep_the_brokerage_prompt():
+    from portfolio_agent.extractor import build_prompt
+    text = build_prompt("x", statement=True)[1].content
+    assert "periodic account statement" in text and "CAPITAL ACCOUNT" not in text
+    assert "CAPITAL ACCOUNT STATEMENT" in build_prompt("x", statement=True, capital=True)[1].content
+
+
+def test_quarterly_accounts_turn_stale_after_four_months(conn, monkeypatch):
+    from portfolio_agent import series
+    from portfolio_agent.timeutil import now
+    acct = {"id": 1, "status": "active", "cadence": "quarterly"}
+    monkeypatch.setattr(store, "open_items_for_account", lambda c, i: [])
+    for days, want in ((100, "ok"), (130, "stale")):
+        when = (now() - timedelta(days=days)).isoformat()
+        monkeypatch.setattr(store, "latest_retrieval", lambda c, i, w=when: w)
+        assert series.account_status(conn, acct) == want
+
+
+def test_open_browser_window_gives_a_plain_message():
+    from portfolio_agent.browser.portal import PROFILE_IN_USE, profile_busy_message
+    raw = ("BrowserType.launch_persistent_context: Opening in existing browser session. This "
+           "usually means that the profile is already in use by another instance of Chromium.")
+    assert PROFILE_IN_USE.search(raw) and not PROFILE_IN_USE.search("net::ERR_NAME_NOT_RESOLVED")
+    msg = profile_busy_message({"institution": "Example Wealth"})
+    assert "Example Wealth" in msg and "close that window" in msg
+
+
+def test_capital_statements_downloaded_by_the_fetcher_are_read(tmp_path, monkeypatch):
+    """A browser login for capital statements: the fetcher returns downloaded PDFs; each
+    new one is saved like an upload and read as its own run item; repeats are skipped."""
+    from portfolio_agent.browser.portal import Evidence
+    from portfolio_agent.runner import run_logins
+    monkeypatch.setattr(config, "STATEMENTS_DIR", tmp_path / "statements")
+    c = store.connect(":memory:")
+    lid = add_login(c, name="Example Ventures", institution="Example Ventures",
+                    cadence="quarterly", statement_kind="capital")
+
+    def fetcher(login, creds, ctx):
+        return Evidence(text="", folder=str(tmp_path), url="https://example.test/docs",
+                        captured_at="2026-11-18T10:00:00+00:00",
+                        documents=[{"name": "q3.pdf", "data": CAPITAL_PDF}])
+    reply = json.dumps({"as_of": "2026-09-30", "accounts": [{
+        "account": "Example Ventures Fund III", "statement_total": 108000.0,
+        "holdings": [{"description": "Example Ventures Fund III", "value": 108000.0}]}]})
+    model = FakeListChatModel(responses=[reply] * 4)
+    run_logins(c, "refresh", lambda: model, fetcher=fetcher, login_ids=[lid])
+    items = [dict(r) for r in c.execute("SELECT outcome, detail FROM run_items ORDER BY id")]
+    assert items[0]["outcome"] == "fetched" and "1 to read" in items[0]["detail"]
+    assert items[1]["outcome"] == "held"
+    assert registry.get_login(c, lid)["accounts"][0]["account_type"] == "private_fund"
+    for i in store.open_review_items(c):          # approve, then fetch the same file again
+        from portfolio_agent.ingest_graph import approve_held
+        approve_held(c, i["id"])
+    run_logins(c, "refresh", lambda: model, fetcher=fetcher, login_ids=[lid])
+    last = dict(c.execute("SELECT outcome, detail FROM run_items ORDER BY id DESC").fetchone())
+    assert last["outcome"] == "fetched" and "1 already read" in last["detail"]
+
+
+def test_only_the_latest_quarters_statements_are_picked():
+    from portfolio_agent.browser.portal import latest_rows, row_quarter
+    assert row_quarter("Capital Account Statement Q3 2026") == (2026, 3)
+    assert row_quarter("Period ending September 30, 2026") == (2026, 3)
+    assert row_quarter("2026-06-30") == (2026, 2) and row_quarter("12/31/25") == (2025, 4)
+    assert row_quarter("Capital Statement 2026/06/30") == (2026, 2)
+    assert row_quarter("no date here") is None
+    rows = ["Example Fund A Q3 2026", "Example Fund B Sep 30, 2026", "Example Fund A Q2 2026",
+            "Example Fund A Q1 2026"]
+    assert latest_rows(rows) == ([0, 1], "2026 Q3")
+    assert latest_rows(["Statement", "Statement"]) == ([0], "first listed (no dates found)")
+    assert latest_rows([]) == ([], "first listed (no dates found)")
+
+
+def test_captcha_with_a_hidden_window_stops_instead_of_waiting(monkeypatch):
+    from portfolio_agent.browser import portal
+    from portfolio_agent.browser.guard import FetchStopped
+    monkeypatch.setattr(config, "HEADLESS", True)
+    with pytest.raises(FetchStopped) as e:
+        portal._wait_for_person(object(), {"id": 1, "name": "Example"}, portal.FetchContext(
+            conn=None, run_kind="refresh", request_code=lambda r: None, model_loader=lambda: None), [])
+    assert e.value.kind == "captcha" and "open-browser" in e.value.message
+
+
+def test_fund_portal_rows_keep_their_own_as_of_dates(conn, monkeypatch):
+    """Strategic Partners' Performance Summary: each fund row is an account valued at its
+    Unrealized Value as of its own date, months before the page was captured."""
+    from portfolio_agent.ingest_graph import build_ingest_graph
+    monkeypatch.setattr(config, "PORTAL_MAX_AGE_DAYS", 5)       # the live-page rule is on
+    lid = add_login(conn, name="Strategic Partners", institution="Blackstone Strategic Partners",
+                    login_url="https://www.example-sp.test", allowed_domains=None,
+                    statement_kind="capital", cadence="quarterly")
+    lg = registry.get_login(conn, lid)
+    page = ("Performance Summary (USD)\nFund  Commitment  Unrealized Value  As of\n"
+            "Example Partners VIII  100,000  60,000  06/30/2026\n"
+            "Example Partners IX  50,000  20,000  09/30/2026\nTotal  150,000  80,000\n")
+    seen = []
+
+    class Model:
+        def invoke(self, messages):
+            seen.append(messages[1].content)
+            return FakeListChatModel(responses=[json.dumps({"as_of": None, "grand_total": 80000.0,
+                "accounts": [
+                    {"account": "Example Partners VIII", "as_of": "2026-06-30",
+                     "statement_total": 60000.0,
+                     "holdings": [{"description": "Example Partners VIII", "value": 60000.0}]},
+                    {"account": "Example Partners IX", "as_of": "2026-09-30",
+                     "statement_total": 20000.0,
+                     "holdings": [{"description": "Example Partners IX", "value": 20000.0}]}]})]
+                ).invoke(messages)
+
+    out = build_ingest_graph(Model(), conn).invoke({
+        "text": page, "evidence": "/tmp/evidence", "login": lg, "source": "portal",
+        "retrieved_at": "2026-11-18T18:00:00+00:00"})
+    assert "Unrealized Value" in seen[0] and "As of" in seen[0]
+    assert 'grand_total = "Total Unrealized Value"' in seen[0] and "Realized Value" in seen[0]
+    assert out["outcome"] in ("held", "mixed"), out.get("errors")
+    dates = sorted(i["payload"]["snapshot"]["as_of_datetime"][:10]
+                   for i in store.open_review_items(conn))
+    assert dates == ["2026-06-30", "2026-09-30"]
+    assert {a["account_type"] for a in registry.get_login(conn, lid)["accounts"]} == {"private_fund"}
+
+
+def test_star_mountain_per_fund_settings_and_notes(conn):
+    from portfolio_agent.extractor import build_prompt
+    from portfolio_agent.statement_guides import guide_for
+    lid = add_login(conn, name="Star Mountain", institution="Star Mountain Capital",
+                    login_url="https://www.example-sm.test", allowed_domains=None,
+                    statement_kind="capital", cadence="quarterly",
+                    document_name="Capital Statement", fund_column="Fund Name")
+    lg = registry.get_login(conn, lid)
+    assert lg["document_name"] == "Capital Statement"
+    assert lg["fund_column"] == "Fund Name"
+    g = guide_for(lg["institution"])
+    assert g.keywords[0] == "star mountain" and "Ending Balance" in g.notes
+    text = build_prompt("x", g.notes, statement=True, capital=True)[1].content
+    assert "Ending Balance" in text and "TOP of the statement" in text
+
+
+def test_wait_after_sign_in_is_a_login_setting_and_can_be_cancelled(conn):
+    from portfolio_agent.browser import portal
+    from portfolio_agent.browser.guard import FetchStopped, Trace
+    lid = add_login(conn, post_login_wait="30")
+    assert registry.get_login(conn, lid)["post_login_wait"] == 30
+    with pytest.raises(ValueError):
+        registry.LoginIn(name="x", institution="x", post_login_wait=999)
+
+    class Page:
+        waited = 0
+        def wait_for_timeout(self, ms): Page.waited += ms
+        def wait_for_load_state(self, *a, **k): pass
+
+    calls = {"n": 0}
+    def cancel_after_3():
+        calls["n"] += 1
+        return calls["n"] > 3
+    holder = portal._Holder(Page(), time.monotonic() + 60, cancel_after_3)
+    with pytest.raises(FetchStopped):
+        portal._wait_after_login(holder, {"post_login_wait": 30}, Trace())
+    assert Page.waited == 3000              # stopped as soon as Cancel was pressed
+    portal._wait_after_login(holder, {}, Trace())   # no wait set: returns at once
+
+
+def test_a_second_login_with_the_same_name_gets_a_clear_message(client):
+    body = {"name": "Example Wealth", "institution": "Example Wealth", "access_method": "upload"}
+    assert client.post("/api/logins", headers=H, json=body).status_code == 200
+    r = client.post("/api/logins", headers=H, json={**body, "name": "example wealth"})
+    assert r.status_code == 400 and "already exists" in r.json()["detail"]
+    lid = client.get("/api/logins").json()[0]["id"]          # saving it again is fine
+    assert client.put(f"/api/logins/{lid}", headers=H, json=body).status_code == 200
+
+
+def test_google_logins_use_installed_chrome_with_their_own_profile(tmp_path, monkeypatch):
+    from portfolio_agent.browser import portal
+    from portfolio_agent.browser.guard import FetchStopped
+    monkeypatch.setattr(config, "BROWSER_PROFILES_DIR", tmp_path / "browser")
+    chrome = tmp_path / "Google Chrome"
+    chrome.write_text("")
+    monkeypatch.setattr(config, "GOOGLE_CHROME_APP", chrome)
+    profile, channel = portal.browser_profile({"institution": "Example", "sign_in_with": "google"})
+    assert channel == "chrome" and profile.name == "example-chrome"
+    profile, channel = portal.browser_profile({"institution": "Example", "sign_in_with": "password"})
+    assert channel is None and profile.name == "example"
+    monkeypatch.setattr(config, "GOOGLE_CHROME_APP", tmp_path / "missing")
+    with pytest.raises(FetchStopped):
+        portal.browser_profile({"institution": "Example", "sign_in_with": "google"})
+
+
+def test_frec_reads_its_dashboard_totals(conn):
+    from portfolio_agent.statement_guides import guide_for
+    lid = add_login(conn, name="Frec", institution="Frec", login_url="https://frec.com/app/login",
+                    allowed_domains=None, sign_in_with="google", read_landing_page=True)
+    assert registry.get_login(conn, lid)["read_landing_page"] is True
+    g = guide_for("Frec")
+    assert "dashboard" in g.portal_notes.lower() and "TOTAL value" in g.portal_notes
+    assert "TOTAL PRICED PORTFOLIO" in g.notes          # statements keep their own notes
+
+
+def test_an_image_only_pdf_is_read_with_ocr(tmp_path, monkeypatch):
+    """A scanned statement has no text layer: its pages are read by local OCR instead of
+    stopping. (The OCR itself runs macOS Vision; here it is stood in for.)"""
+    from portfolio_agent import documents
+    from portfolio_agent.statements import read_uploads, save_upload
+    monkeypatch.setattr(config, "STATEMENTS_DIR", tmp_path / "statements")
+    monkeypatch.setattr(documents, "pdf_pages", lambda p: [""])        # images only
+    monkeypatch.setattr(documents, "ocr_pdf",
+                        lambda p, max_pages=50: "[page 1]\nExample Fund\nEnding Balance 108,000.00\n")
+    c = store.connect(":memory:")
+    lid = add_login(c, name="Example Capital", institution="Example Capital",
+                    access_method="upload", statement_kind="capital", login_url=None,
+                    allowed_domains=None)
+    lg = registry.get_login(c, lid)
+    up = save_upload(c, lg, "scan.pdf", STATEMENT_PDF)
+    reply = json.dumps({"as_of": "2026-06-30", "accounts": [{
+        "account": "Example Fund", "statement_total": 108000.0,
+        "holdings": [{"description": "Example Fund", "value": 108000.0}]}]})
+    read_uploads(c, store.start_run(c, "upload"), lg, [up["id"]],
+                 lambda: FakeListChatModel(responses=[reply] * 3))
+    outcome, trace = c.execute("SELECT outcome, trace FROM run_items").fetchone()
+    assert outcome == "held"
+    assert json.loads(trace)[1]["ocr"] is True
+
+
+def test_portal_row_dates_are_read_by_code():
+    from datetime import date
+    from portfolio_agent.statement_guides import STRATEGIC_PARTNERS, account_date, row_dates
+    from portfolio_agent.timeutil import parse_date_text
+    assert parse_date_text("Jun-30-2026") == date(2026, 6, 30)
+    assert parse_date_text("30-Jun-2026") == date(2026, 6, 30)
+    assert parse_date_text("Sep 30, 2025") == date(2025, 9, 30)
+    assert parse_date_text("Total") is None
+    text = ("Performance Summary (USD)\n"
+            "=== Table 1 (one row per line) ===\n"
+            "Fund | Invested Capital | Unrealized Value | As of Date\n"
+            " | Sample Partners | 100 | 90 | Mar-31-2026\n"
+            "Fund A | 60 | 50 | Mar-31-2026\n"
+            "Fund B | 40 | 40 | Dec-31-2025\n"
+            "Total | 100 | 90\n")
+    dates = row_dates(text, STRATEGIC_PARTNERS)
+    assert dates == {"sample partners": date(2026, 3, 31), "fund a": date(2026, 3, 31),
+                     "fund b": date(2025, 12, 31)}
+    assert account_date("Fund B", dates) == date(2025, 12, 31)
+    assert account_date("Unknown", dates) is None          # rows disagree: no guess
+    tabbed = "Fund\tUnrealized Value\tAs of Date\nFund A\t50\tJun-30-2026\n"
+    assert account_date("Other", row_dates(tabbed, STRATEGIC_PARTNERS)) == date(2026, 6, 30)
+
+
+def test_row_dates_override_the_models_date():
+    from portfolio_agent.ingest_graph import apply_row_dates
+    from portfolio_agent.schemas import Extraction
+    ext = Extraction.model_validate({"as_of": None, "accounts": [
+        {"account": "Fund A", "as_of": "2026-11-01", "holdings": [{"description": "Fund A", "value": 50}]}]})
+    text = "Fund | Unrealized Value | As of Date\nFund A | 50 | Jun-30-2026\n"
+    out = apply_row_dates(ext, text, "Strategic Partners")
+    assert out.accounts[0].as_of_datetime.date().isoformat() == "2026-06-30"
+
+
+def test_balance_only_account_gets_its_total_as_one_holding():
+    from portfolio_agent.ingest_graph import balance_holdings
+    from portfolio_agent.schemas import Extraction
+    ext = Extraction.model_validate({"as_of": "2026-11-01", "accounts": [
+        {"account": "Card", "statement_total": -120.5, "holdings": []},
+        {"account": "Checking", "statement_total": 40, "holdings": [{"description": "Cash", "value": 40}]},
+        {"account": "Unknown", "holdings": []}]})
+    out = balance_holdings(ext)
+    assert [(h.description, h.value) for h in out.accounts[0].holdings] == [("Card", -120.5)]
+    assert out.accounts[1].holdings == ext.accounts[1].holdings
+    assert out.accounts[2].holdings == []        # no total: still caught by the validator
+
+
+def test_ignored_accounts_numbers_are_not_missed_accounts(conn):
+    from portfolio_agent.schemas import Extraction
+    from portfolio_agent.validator import unlisted_accounts
+    c = conn
+    lid = add_login(c)
+    keep = active_account(c, lid, "Checking", "1111")
+    gone = active_account(c, lid, "Old Brokerage", "2222")
+    c.execute("UPDATE accounts SET status='ignored' WHERE id=?", (gone,))
+    assert keep and registry.set_aside_last4s(c, lid) == ["2222"]
+    ext = Extraction.model_validate({"as_of": "2026-11-01", "accounts": [
+        {"account": "Checking", "account_suffix": "1111", "statement_total": 5,
+         "holdings": [{"description": "Cash", "value": 5}]}]})
+    text = "Checking\n...1111\nOld Brokerage\n...2222\n"
+    assert len(unlisted_accounts(text, ext)) == 1
+    assert unlisted_accounts(text, ext, registry.set_aside_last4s(c, lid)) == []
+
+
+def test_monthly_login_downloads_only_the_newest_months_statement():
+    from portfolio_agent.browser.portal import latest_rows
+    rows = ["NAV Statement 31-Aug-2026 Download", "NAV Statement 31-Oct-2026 Download",
+            "NAV Statement 30-Sep-2026 Download"]
+    assert latest_rows(rows, monthly=True) == ([1], "2026-10")
+    assert latest_rows(rows + ["NAV Statement 30-Nov-2026"]) == ([1, 3], "2026 Q4")   # quarterly
+
+
+def test_otp_button_is_a_login_step(conn):
+    lid = add_login(conn, otp_button="Generate New OTP", twofa_method="email")
+    assert registry.get_login(conn, lid)["otp_button"] == "Generate New OTP"
+
+
+def _mail(sender, subject, body, html=False):
+    from email.message import EmailMessage
+    m = EmailMessage()
+    m["From"], m["Subject"] = sender, subject
+    m.set_content(body, subtype="html" if html else "plain")
+    return m.as_bytes()
+
+
+class FakeImap:
+    """Stands in for Gmail: (uid, arrived 'DD-Mon-YYYY HH:MM:SS +0000', raw message)."""
+    def __init__(self, msgs):
+        self.msgs, self.fetched = msgs, []
+
+    def uid(self, cmd, *args):
+        if cmd == "SEARCH":
+            return "OK", [b" ".join(str(u).encode() for u, _, _ in self.msgs)]
+        uid, what = int(args[0]), args[1]
+        assert "PEEK" in what                       # never marks a message read
+        _, arrived, raw = next(m for m in self.msgs if m[0] == uid)
+        self.fetched.append((uid, what))
+        if "HEADER.FIELDS" in what:
+            frm = raw.split(b"\n", 1)[0]
+            return "OK", [(f'{uid} (INTERNALDATE "{arrived}" BODY[...]'.encode(), frm)]
+        return "OK", [(f"{uid} (BODY[] ".encode(), raw)]
+
+    def logout(self):
+        pass
+
+
+def test_emailed_code_is_read_only_from_the_portals_domain_after_the_request(monkeypatch):
+    from datetime import datetime, timezone
+    from portfolio_agent import email_codes
+    since = datetime(2026, 11, 22, 23, 50, tzinfo=timezone.utc)
+    fake = FakeImap([
+        (1, "22-Nov-2026 23:40:00 +0000", _mail("Example <otp@portal.example>", "Your OTP", "Your OTP is 111111")),
+        (2, "22-Nov-2026 23:51:00 +0000", _mail("Shop <deals@shop.example>", "Code", "Use code 999999")),
+        (3, "22-Nov-2026 23:51:30 +0000", _mail("Example <no-reply@mail.portal.example>", "Login",
+                                               "<p>Your one time password is <b>246810</b></p>", html=True)),
+    ])
+    monkeypatch.setattr(email_codes, "_connect", lambda s: fake)
+    assert email_codes.codes_since({}, since, ["portal.example"]) == ["246810"]
+    assert all(uid != 1 or "HEADER" in w for uid, w in fake.fetched)      # older one never read
+    assert not any(uid == 2 and "BODY.PEEK[]" == w.strip("()") for uid, w in fake.fetched)
+    assert email_codes.sender_matches("A <x@portal.example>", ["portal"])
+    assert not email_codes.sender_matches("A <x@notportal.example.com>", ["portal.example"])
+
+
+def test_gmail_reader_settings_are_stored_encrypted(conn):
+    from portfolio_agent import email_codes
+    email_codes.save_settings(conn, "alex@example.com", "abcd efgh ijkl mnop")
+    raw = conn.execute("SELECT secret FROM app_secrets").fetchone()[0]
+    assert b"alex" not in raw and b"abcd" not in raw
+    assert email_codes.get_settings(conn) == {"address": "alex@example.com",
+                                              "app_password": "abcdefghijklmnop"}
+    email_codes.clear_settings(conn)
+    assert email_codes.get_settings(conn) is None
+
+
+def test_sign_in_waits_for_slow_portal(monkeypatch):
+    """After pressing sign-in, a portal that keeps its form up for a while (a status
+    notice, a reload) isn't taken as a rejected login; a shown error stops the wait."""
+    from portfolio_agent.browser import portal
+
+    class Page:
+        url = "https://example.com/login"
+        def wait_for_load_state(self, *a, **k): pass
+        def wait_for_timeout(self, ms): pass
+
+    class Holder:
+        page = Page()
+        def check(self): pass
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(portal.time, "monotonic", lambda: clock["t"])
+    seen = {"n": 0}
+
+    def on_form(page, domains, start_url=None):
+        seen["n"] += 1
+        clock["t"] += 1.0
+        return seen["n"] < 15            # form gone after ~15 s
+    monkeypatch.setattr(portal, "_on_login_form", on_form)
+    monkeypatch.setattr(portal, "_login_message", lambda p, d: "Signing you in")
+    assert portal._wait_past_login(Holder(), ["example.com"], timeout_s=60) is True
+
+    clock["t"], seen["n"] = 0.0, 0
+    monkeypatch.setattr(portal, "_on_login_form", lambda p, d, u=None: clock.update(t=clock["t"] + 1) or True)
+    monkeypatch.setattr(portal, "_login_message", lambda p, d: "Invalid OTP entered")
+    assert portal._wait_past_login(Holder(), ["example.com"], timeout_s=60) is False
+    assert clock["t"] < 15               # stopped on the error, not at the deadline
+
+
+def test_monthly_descriptions_in_mixed_styles():
+    """A NAV list's "Description" column writes each month its own way."""
+    from portfolio_agent.browser.portal import latest_rows, row_month
+    rows = ["1st Sept - 30th Sept 2026 | Example Fund - Class 2 - X9 | Alex",
+            "Aug-2026 | Example Fund - Class 2 - X9 | Alex", "July 2026 | Example Fund",
+            "March-2026 | Example Fund", "Download"]
+    assert [row_month(r) for r in rows] == [(2026, 9), (2026, 8), (2026, 7), (2026, 3), None]
+    assert latest_rows(rows, monthly=True) == ([0], "2026-09")
+
+
+def test_documents_page_address_only_on_the_logins_site():
+    """The documents tab can be the page's address; one on another site is never opened."""
+    import pytest
+    from portfolio_agent.browser import portal
+    from portfolio_agent.browser.guard import FetchStopped
+
+    class Page:
+        url = "https://portal.example.com/home"
+        def goto(self, *a, **k): raise AssertionError("must not open another site")
+
+    class Holder:
+        page = Page()
+        def check(self): pass
+
+    with pytest.raises(FetchStopped) as e:
+        portal._fetch_documents(Holder(), None, {"cadence": "monthly"},
+                                {"documents_tab": "https://other.example.net/docs?id=1"},
+                                ["portal.example.com"], None)
+    assert e.value.kind == "blocked_click"
+
+
+def test_each_section_has_its_own_address(client):
+    for path in ("/", "/dashboard", "/inbox", "/accounts", "/debug", "/inbox/"):
+        r = client.get(path)
+        assert r.status_code == 200 and '<nav>' in r.text, path
+    assert client.get("/app.js").status_code == 200
+    assert client.get("/style.css").status_code == 200
+    assert client.get("/nowhere").status_code == 404
+    assert client.get("/api/runs").status_code == 200
+
+
+def test_option_cleanup_rules():
+    """Unbuilt access methods can't be chosen; removed choices are refused; Refresh is
+    supported only for browser logins."""
+    import pytest
+    base = {"name": "x", "institution": "x", "login_url": "https://www.example.com"}
+    for m in ("api", "email_statement", "manual"):
+        with pytest.raises(ValueError, match="isn't available yet"):
+            registry.LoginIn(**base, access_method=m)
+    with pytest.raises(ValueError):
+        registry.LoginIn(**base, twofa_method="authenticator")
+    for t in ("wealth_management", "other"):
+        with pytest.raises(ValueError):
+            registry.AccountEdit(display_name="Alex", account_type=t)
+    assert "refresh supported" not in " ".join(registry.check(registry.LoginIn(**base, refresh_supported=True))).lower()
+    assert any("Refresh is supported only" in e for e in registry.check(
+        registry.LoginIn(name="x", institution="x", access_method="upload", refresh_supported=True)))
+    assert not registry.LoginIn(**base).refresh_supported      # off until you tick it

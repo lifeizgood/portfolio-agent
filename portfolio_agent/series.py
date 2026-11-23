@@ -125,5 +125,6 @@ def account_status(conn, account: dict) -> str:
         return "stale"
     age_h = (now() - parse_iso(last)).total_seconds() / 3600
     limit = {"nightly": config.STALE_HOURS_NIGHTLY,
-             "monthly": 24 * config.STALE_DAYS_MONTHLY}.get(account["cadence"], 24 * 30 * 6)
+             "monthly": 24 * config.STALE_DAYS_MONTHLY,
+             "quarterly": 24 * config.STALE_DAYS_QUARTERLY}.get(account["cadence"], 24 * 30 * 6)
     return "stale" if age_h > limit else "ok"

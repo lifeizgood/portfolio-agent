@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import config, store
-from .documents import TRUNCATED, LockedPdf, read_text
+from .documents import OCR_NOTE, TRUNCATED, LockedPdf, OcrUnavailable, read_text
 from .ingest_graph import build_ingest_graph
 from .statement_guides import guide_for, trim
 from .timeutil import now, now_iso
@@ -119,56 +119,7 @@ def read_uploads(conn, run_id: int, login: dict, upload_ids: list[int],
         if cancelled():
             not_started = len(upload_ids) - n
             break
-        up = store.get_upload(conn, uid)
-        item = store.start_run_item(conn, run_id, login["id"])
-        if ingested(conn, up):            # already ingested: ignored, never stored twice
-            store.finish_run_item(conn, item, "skipped",
-                                  f"{up['filename']}: already read ({up['outcome']}); ignored.",
-                                  [], up["path"])
-            counts["skipped"] = counts.get("skipped", 0) + 1
-            continue
-        trace = [{"action": "read_statement", "file": up["filename"], "at": now_iso()}]
-        outcome, detail = "error", ""
-        try:
-            full = read_text(up["path"], 10**8)
-            guide = guide_for(login["institution"])
-            text = trim(full, guide)      # activity, footnotes and disclosures left out
-            if len(text) > config.STATEMENT_MAX_CHARS:
-                text = text[:config.STATEMENT_MAX_CHARS] + TRUNCATED
-            trace.append({"action": "statement_text", "chars": len(full), "read": len(text),
-                          "guide": guide.keywords[0] if guide else None,
-                          "truncated": text.endswith(TRUNCATED)})
-            if not text.replace("[page", "").strip(" \n0123456789]"):
-                raise UploadError("No text could be read from this PDF (it may be a scan).")
-            graph = build_ingest_graph(model_loader(), conn)
-            out = graph.invoke({"text": text, "evidence": up["path"], "login": login,
-                                "source": "statement", "run_id": run_id,
-                                "retrieved_at": now_iso()})
-            outcome = out["outcome"]
-            if out.get("results"):
-                detail = "; ".join(f"{r['account']}: {r['outcome']}" for r in out["results"])
-            else:
-                detail = "; ".join(out.get("errors") or [])
-            if text.endswith(TRUNCATED):
-                detail += (" (The statement was too long to read in full; later pages were "
-                           "left out. If an account is missing, upload its own statement.)")
-            for r in out.get("results") or []:
-                counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
-            if outcome == "review":
-                counts["review"] = counts.get("review", 0) + 1
-        except LockedPdf:
-            outcome, detail = "stopped", ("This PDF is password-protected. Save an unlocked "
-                                          "copy (open it and print to PDF), then upload that.")
-            counts["stopped"] = counts.get("stopped", 0) + 1
-        except UploadError as e:
-            outcome, detail = "stopped", str(e)
-            counts["stopped"] = counts.get("stopped", 0) + 1
-        except Exception as e:     # not covered by the rules: say so in the run
-            outcome, detail = "error", f"{type(e).__name__}: {e}"
-            counts["error"] = counts.get("error", 0) + 1
-        detail = f"{up['filename']}: {detail}"
-        store.finish_run_item(conn, item, outcome, detail, trace, up["path"])
-        store.set_upload_result(conn, uid, run_id, outcome, detail)
+        read_one(conn, run_id, login, uid, model_loader, counts)
     if not_started:
         counts["not started"] = not_started
     summary = ", ".join(f"{n} {k}" for k, n in sorted(counts.items())) or "nothing to read"
@@ -176,3 +127,61 @@ def read_uploads(conn, run_id: int, login: dict, upload_ids: list[int],
         store.finish_run(conn, run_id, "cancelled", "Cancelled by you. " + summary)
     else:
         store.finish_run(conn, run_id, "done", summary)
+
+
+def read_one(conn, run_id: int, login: dict, uid: int, model_loader: Callable[[], object],
+             counts: dict[str, int]) -> str:
+    """Read one saved statement as its own run item; returns its outcome. Used for
+    uploads and for statements the fetcher downloaded from a portal."""
+    up = store.get_upload(conn, uid)
+    item = store.start_run_item(conn, run_id, login["id"])
+    if ingested(conn, up):            # already ingested: ignored, never stored twice
+        store.finish_run_item(conn, item, "skipped",
+                              f"{up['filename']}: already read ({up['outcome']}); ignored.",
+                              [], up["path"])
+        counts["skipped"] = counts.get("skipped", 0) + 1
+        return "skipped"
+    trace = [{"action": "read_statement", "file": up["filename"], "at": now_iso()}]
+    outcome, detail = "error", ""
+    try:
+        full = read_text(up["path"], 10**8)
+        guide = guide_for(login["institution"])
+        text = trim(full, guide)      # activity, footnotes and disclosures left out
+        if len(text) > config.STATEMENT_MAX_CHARS:
+            text = text[:config.STATEMENT_MAX_CHARS] + TRUNCATED
+        trace.append({"action": "statement_text", "chars": len(full), "read": len(text),
+                      "ocr": full.startswith(OCR_NOTE),
+                      "guide": guide.keywords[0] if guide else None,
+                      "truncated": text.endswith(TRUNCATED)})
+        if not text.replace("[page", "").strip(" \n0123456789]"):
+            raise UploadError("No text could be read from this PDF (it may be a scan).")
+        graph = build_ingest_graph(model_loader(), conn)
+        out = graph.invoke({"text": text, "evidence": up["path"], "login": login,
+                            "source": "statement", "run_id": run_id,
+                            "retrieved_at": now_iso()})
+        outcome = out["outcome"]
+        if out.get("results"):
+            detail = "; ".join(f"{r['account']}: {r['outcome']}" for r in out["results"])
+        else:
+            detail = "; ".join(out.get("errors") or [])
+        if text.endswith(TRUNCATED):
+            detail += (" (The statement was too long to read in full; later pages were "
+                       "left out. If an account is missing, upload its own statement.)")
+        for r in out.get("results") or []:
+            counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
+        if outcome == "review":
+            counts["review"] = counts.get("review", 0) + 1
+    except LockedPdf:
+        outcome, detail = "stopped", ("This PDF is password-protected. Save an unlocked "
+                                      "copy (open it and print to PDF), then upload that.")
+        counts["stopped"] = counts.get("stopped", 0) + 1
+    except (UploadError, OcrUnavailable) as e:
+        outcome, detail = "stopped", str(e)
+        counts["stopped"] = counts.get("stopped", 0) + 1
+    except Exception as e:     # not covered by the rules: say so in the run
+        outcome, detail = "error", f"{type(e).__name__}: {e}"
+        counts["error"] = counts.get("error", 0) + 1
+    detail = f"{up['filename']}: {detail}"
+    store.finish_run_item(conn, item, outcome, detail, trace, up["path"])
+    store.set_upload_result(conn, uid, run_id, outcome, detail)
+    return outcome

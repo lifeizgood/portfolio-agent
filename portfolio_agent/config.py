@@ -41,9 +41,22 @@ STEP_BUDGET = int(os.getenv("PA_STEP_BUDGET", "8"))
 # Portal fetcher limits (spec §9.2).
 FETCH_STEP_BUDGET = int(os.getenv("PA_FETCH_STEPS", "25"))         # LLM navigation steps
 FETCH_TIMEOUT_S = int(os.getenv("PA_FETCH_TIMEOUT", "300"))        # placeholder, spec D10
+LOGIN_WAIT_S = int(os.getenv("PA_LOGIN_WAIT", "60"))     # after pressing sign-in, for the next page
 MAX_LOGINS_PER_NIGHT = int(os.getenv("PA_MAX_LOGINS", "2"))        # per portal, nightly run
 MAX_PARALLEL_RUNS = int(os.getenv("PA_MAX_PARALLEL", "3"))          # refreshes at once (spec §4)
 TWOFA_WAIT_S = int(os.getenv("PA_2FA_WAIT", "300"))                # wait for the user's code
+CAPTCHA_WAIT_S = int(os.getenv("PA_CAPTCHA_WAIT", "300"))          # wait for you to solve one
+# Google refuses sign-in from the testing build of Chrome, so "Sign in with Google" logins
+# use the installed Google Chrome, with a profile of their own.
+# Built once from portfolio_agent/ocr/pdf_ocr.swift: reads image-only PDFs on this Mac.
+OCR_BIN = Path(os.getenv("PA_OCR_BIN", Path.home() / ".portfolio-agent" / "bin" / "pdf_ocr"))
+OCR_TIMEOUT_S = int(os.getenv("PA_OCR_TIMEOUT", "180"))
+GOOGLE_CHROME_APP = Path(os.getenv("PA_GOOGLE_CHROME",
+                                   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+# Emailed verification codes, read from Gmail over IMAP when the owner sets it up (S19).
+IMAP_HOST = os.getenv("PA_IMAP_HOST", "imap.gmail.com")
+IMAP_PORT = int(os.getenv("PA_IMAP_PORT", "993"))
+EMAIL_WAIT_S = int(os.getenv("PA_EMAIL_WAIT", "180"))
 HEADLESS = os.getenv("PA_HEADLESS", "0") == "1"                    # portals often block headless
 # SMS 2FA: the Messages database, read-only, and how long to wait for the text.
 MESSAGES_DB = Path(os.getenv("PA_MESSAGES_DB", Path.home() / "Library" / "Messages" / "chat.db"))
@@ -71,6 +84,10 @@ PORTAL_MAX_AGE_DAYS = int(os.getenv("PA_PORTAL_MAX_AGE_DAYS", "5"))   # clock sk
 # Staleness: nightly accounts need a value retrieved within this many hours.
 STALE_HOURS_NIGHTLY = int(os.getenv("PA_STALE_HOURS", "30"))
 STALE_DAYS_MONTHLY = int(os.getenv("PA_STALE_DAYS_MONTHLY", "45"))   # monthly statements
+# Quarterly capital statements arrive 2-4 months after the quarter ends, so one is
+# expected about every 3 months: stale after 4 months without a new one (spec D10).
+STALE_DAYS_QUARTERLY = int(os.getenv("PA_STALE_DAYS_QUARTERLY", "120"))
+MAX_DOCUMENTS = int(os.getenv("PA_MAX_DOCUMENTS", "40"))   # statements downloaded per run
 
 # Dashboard server: localhost only.
 HOST = "127.0.0.1"

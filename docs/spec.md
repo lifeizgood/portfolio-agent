@@ -290,6 +290,8 @@ A separate schema stores each capital statement's roll-forward, so it can be rec
 
 The exact field list depends on what real statements show; see D24.
 
+*Today's code: capital statements are uploaded and stored as **one holding**, the ending capital balance for the period, dated by the period end [U, 2026-11-18]. The roll-forward table and V7 aren't built yet.*
+
 ### 5.3 Cash flows [U D6]
 
 - CAGR accounts for every withdrawal, contribution and distribution.
@@ -324,20 +326,20 @@ The user maintains the registry through the UI; agents only read it [U D1].
 | Field | Records | Used by |
 |---|---|---|
 | Display name | e.g. "Schwab joint brokerage" | Dashboard, summary, Q&A |
-| Institution, account type | Brokerage / retirement / wealth management / private fund | Grouping; cadence |
-| Access method | Browser, API, email statement, **upload** or manual. Upload: the user uploads monthly PDF statements in the dashboard, for institutions whose portal can't be read daily; nightly runs and Refresh skip these logins. Chosen by the user; the system doesn't decide [U D1, 2026-11-12] | Orchestrator |
+| Institution, account type | Brokerage / retirement / private fund / bank / loan / credit card | Grouping; cadence |
+| Access method | Browser or **upload**; API, email statement and manual are shown greyed out and can't be chosen until built [U, 2026-11-22]. Upload: the user uploads monthly PDF statements in the dashboard, for institutions whose portal can't be read daily; nightly runs and Refresh skip these logins. Chosen by the user; the system doesn't decide [U D1, 2026-11-12] | Orchestrator |
 | Login mechanism | Portal URL, credential reference, and the login steps the user enters (Stage 1) [U]. **Sign in with:** username and password, or **Google** (the site's "Sign in with Google"; the user signs in to Google by hand once) [U, 2026-11-12] | Fetcher; browser allowlist |
-| 2FA method | SMS, email or authenticator app. The Auth tool tries email or SMS first, and asks the user when it can't get the code [U C12] | Auth tool |
+| 2FA method | Remembered device, SMS or email (authenticator app removed [U, 2026-11-22]). The Auth tool tries email or SMS first, and asks the user when it can't get the code [U C12] | Auth tool |
 | Statement sender | Full email address of the statement sender | Mail filter |
 | PDF password source | Sender of the password email, or a password the user stores [U D8] | Statement fetcher |
-| Update cadence | Nightly; **monthly** (stale 45 days after the last statement); or quarterly with a 2–4 month lag | Orchestrator; staleness check |
-| Holds public securities | Yes / no; decides whether Refresh includes the account [U] | Refresh |
+| Update cadence | Nightly; **monthly** (stale 45 days after the last statement); or **quarterly** with a 2–4 month lag (stale 120 days after the last statement, provisional pending D10) | Orchestrator; staleness check |
+| Refresh supported | Yes / no (browser logins only). Yes: the login has a Refresh button and is part of the Dashboard's Refresh; no: it shows Upload statements [U, 2026-11-22; replaces "holds public securities"] | Refresh |
 | Status | Active, or closed with a close date | Orchestrator; completeness; history |
 
 - **Every edit is checked in code:** the credential exists, the portal domain is added to the allowlist, and the sender is a full email address [2.1].
 - **Agents can suggest, not change.** A new sender or portal address becomes an inbox suggestion. Only the user approves registry changes [2.1, 6.1].
 
-*Today's code (`registry.py`, Accounts & logins in the dashboard): logins with URL, domains, 2FA method, cadence (nightly, monthly), access method (browser or upload in use), holds-public-securities and encrypted credentials; accounts with display name, type, category, status (pending, active, excluded, ignored, closed), debt flag and owner; login rules. Not yet: statement sender, PDF password source, quarterly cadence, and registry suggestions from agents.*
+*Today's code (`registry.py`, Accounts & logins in the dashboard): logins with URL, domains, 2FA method, cadence (nightly, monthly), access method (browser or upload), refresh supported and encrypted credentials; accounts with display name, type, category, status (pending, active, excluded, ignored, closed), debt flag and owner; login rules. Not yet: statement sender, PDF password source, quarterly cadence, and registry suggestions from agents.*
 
 ### 5.5 Credentials [U C9, D8]
 
@@ -451,7 +453,7 @@ The validator is deterministic code with no LLM. A snapshot is accepted only if 
 | V8 | **Continuity** | The change from the **nearest earlier accepted value** is explainable [U D19]; a large unexplained move is flagged or held [2.1, 6.1]. Market data looked up by ticker may serve as the benchmark [U C14]. Outcome (C6) and threshold and benchmark (D3) are open | ⚠️ a move above 25% (`PA_LARGE_MOVE`) is held for approval, not rejected; market move is an optional input; the benchmark (D3) is still open |
 | V9 | **Traceability** | Each value has stored, viewable evidence, as required by View Source [4.1, U C5] | ⚠️ evidence is stored with every value and shown by View Source; not checked as a rule |
 | V11 | **Overall total covered** | When a page shows an overall total, the accounts extracted add up to at least that total. They may add up to more: some accounts sit outside the portal's overall value and are still kept [U] | ✅ `validate_extraction` |
-| V13 | **Live page is current** | For a portal page, the as-of is within 5 days of when the page was captured (`PA_PORTAL_MAX_AGE_DAYS`). The extractor is told the capture date, and a page with no date uses the capture time (D16) [U] | ✅ `ingest_graph.check` |
+| V13 | **Live page is current** | For a portal page, the as-of is within 5 days of when the page was captured (`PA_PORTAL_MAX_AGE_DAYS`). An account shown with its own as-of date (e.g. a fund valued at last quarter end) uses that date instead, like a holding's `price_as_of` [U, 2026-11-18]. The extractor is told the capture date, and a page with no date uses the capture time (D16) [U] | ✅ `ingest_graph.check` |
 | V12 | **Every listed account extracted** | Every account number listed on the page (on its own line, e.g. `12A-34567` or `...1234`) matches an extracted account's last 4 characters [U]. Numbers the user marks as not accounts (a member or card number) are left out; a page rejected only for such numbers can be accepted from the Inbox, which saves them for the login [U, 2026-11-12] | ✅ `unlisted_accounts`, `accept_review` |
 | V10 | **Manual input** (Stage 10) | User-entered values pass the same checks as other values for that account type. View Source shows who entered the value, when, and an optional attachment [U D23] | ❌ |
 
@@ -495,9 +497,10 @@ The docs' "retry by another route" (e.g. the PDF instead of the web page) is par
 **Tool access**
 
 - Every tool is read-only.
-- The browser is restricted to registry portal domains and may **submit only the login form**.
+- The browser is restricted to registry portal domains and may **submit only the login form**, plus the documents page's own search box for a capital-statement login [U, 2026-11-18].
 - Passwords are typed only on the login's own domains. **Sign in with Google:** `accounts.google.com` is allowed only during sign-in. There the fetcher may only pick an account in Google's chooser; it never types into Google's pages or grants access, and anything else Google asks for stops the run with an Inbox question [U, 2026-11-12].
 - Clicks on controls labeled **transfer, trade, withdraw, order, delete, settings** are blocked in code.
+- **CAPTCHAs are never answered by the agent.** When one appears, the run brings its (visible) window to the front, posts an Inbox note, and waits up to 5 minutes for the user to solve it; then it continues. With a hidden window it stops and asks the user to sign in by hand [U, 2026-11-18].
 - Credentials are filled from the encrypted store by the Auth tool and never pass through the model.
 - **No network egress of extracted data**: no aggregators. Outbound lookups may carry ticker symbols only, never quantities, values or account details [U C13, C14].
 
@@ -692,6 +695,15 @@ The owner's ruling on each item from the first version of this spec.
 | S8 | Sign in with Google (Frec) | Supported as a login mechanism; the fetcher never types a Google password. The owner signs in to Google by hand; runs reuse that session. | Resolved; built, not yet tried on the real site |
 | S9 | Frec statements | Read the first page only; the value on the closing date is the Closing Balance of TOTAL PRICED PORTFOLIO, stored as one holding (no positions). | Resolved; built, not yet tried on a real statement |
 | S10 | Extra numbers on a page | A page rejected only because it shows numbers that aren't accounts (e.g. a member number) can be accepted in the Inbox; the numbers are saved as "not accounts" for the login. | Resolved; built |
+| S11 | Capital account statements | Start with upload; store one holding per fund (ending capital for the period, dated by the period end). Login setting "Statement type": account or capital. Roll-forward later. | Resolved; built, not yet tried on a real statement |
+| S12 | Capital statements from a fund portal | Browser login → Documents tab → filter or search "Capital Account Statements" → download the latest statements (newest quarter listed) and read each as a capital statement (Strategic Partners first). Tab and filter labels are per-login settings. | Resolved; built, tried on fake pages only |
+| S13 | Strategic Partners values from its portal page | After sign-in, read Performance Summary (USD): each fund's Unrealized Value, dated by its own As of Date column (last column, e.g. Jun-30-2026), read by code from the row, overriding the model. The check total is Total Unrealized Value, not Total Current Value (which adds realized value already paid out). No Documents step. Accounts can carry their own as-of on a portal page. | Resolved; built, tried on made-up pages only |
+| S14 | Star Mountain capital statements, per fund | Open each fund (named in the dashboard's \"Fund Name\" column) → its Documents tab → wait → latest file named "Capital Statement" → Ending Balance for the period, dated by the date at the top. Waits 30 s after sign-in for the page to load (per-login setting). | Resolved; built, tried on made-up pages only |
+| S15 | Frec from its dashboard | Sign in with Google (installed Chrome), then read the page after sign-in: each account's total value, one holding per account. Per-login setting "Read the page shown after sign-in". | Resolved; built, not yet tried on the real site |
+| S16 | Scanned statements | A PDF with no text layer is read by OCR on the Mac (macOS Vision), not a cloud service. | Resolved; built |
+| S17 | Balance-only accounts and ignored numbers | An account read with a total but no holdings (card, loan, bank) gets one holding worth that total, in code, instead of a retry. The missed-account check skips numbers of the login's ignored or closed accounts, which the page may still list. | Resolved; built, tested on made-up data |
+| S18 | Sign-in that sends its code on request (Tattva) | Login step "button that sends the code": after username and password, press it, get the code (from Gmail, S19, else the Inbox), type it, press Login, then wait up to 60 s for the form to go away (slow portals show a notice first; an error message next to the form ends the wait). Then the documents tab (e.g. NAV) with no filter; a monthly login downloads only the newest month's statement. | Resolved; built, tried on a made-up portal only |
+| S19 | Emailed verification codes from Gmail | Owner's choice: read emailed codes from Gmail over IMAP with an app password (encrypted). Read-only, PEEK; only messages after the request, from the login's domains or its code sender (e.g. a different domain than the portal). Inbox is the fallback. The only outside connection besides the portals. | Resolved; built, tested with a fake mailbox |
 
 ---
 
@@ -731,7 +743,7 @@ The owner's ruling on each item from the first version of this spec.
 | Validator V7 (roll-forward), V9 (traceability) | ❌ / ⚠️ |
 | Validator V8 (continuity) | ⚠️ held for approval above 25%; benchmark open (D3) |
 | Extract → validate → retry once → review | ✅ `ingest_graph.py` (retry semantics deferred) |
-| Capital-statement extraction (NAV, excluding unfunded commitment) | ✅ `extractor.py`; no roll-forward fields |
+| Capital-statement extraction (NAV, excluding unfunded commitment) | ✅ `extractor.py` (`CAPITAL_NOTE`, upload logins with statement type "capital"); no roll-forward fields |
 | ReAct Q&A with read-only tools | ✅ `react_graph.py`, `tools.py`, not yet in the dashboard. Needs a 30 s limit instead of `STEP_BUDGET = 8`. Not needed until Stage 12. |
 | Orchestrator, nightly run, Refresh | ✅ `runner.py`, `cli.py`; parallel runs, cancel, run trace in the Debug tab |
 | Portal fetcher | ✅ `browser/portal.py`: persistent profile per institution, playbook steps, LLM fallback navigator, account numbers from details pages |
@@ -739,6 +751,7 @@ The owner's ruling on each item from the first version of this spec.
 | Statement upload (upload logins, guides, duplicate check, sold options) | ✅ `statements.py`, `statement_guides.py`, `ingest_graph.py` (Stage 1 addition) |
 | Statement fetcher (email, Stages 7 and 13) | ❌ |
 | Sign in with Google | ✅ `browser/portal.py` (`_google_login`); tried on fake pages only |
+| Capital statements from a portal's documents page (Stage 4) | ✅ `browser/portal.py` (`_fetch_documents`), `runner._read_documents`; tried on fake pages only. No pagination yet |
 | Registry UI, encrypted credentials | ✅ Accounts & logins: logins, accounts, include/exclude, login rules, debt flags, owners and part-owned shares. ❌ statement sender, PDF password source |
 | Dashboard | ✅ FastAPI + web front end (`web/`): net worth, charts (daily/monthly, split by account/institution/type/none, "as known on"), Accounts table with filters, View Source, Inbox, Debug. ❌ IRR / time-weighted returns, recommendations file |
 | Completeness / stale check | ✅ `series.account_status` (nightly and monthly cadences) |

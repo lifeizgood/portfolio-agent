@@ -86,6 +86,11 @@ CREATE TABLE IF NOT EXISTS logins (
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS app_secrets (       -- e.g. the Gmail reader; encrypted
+    name         TEXT PRIMARY KEY,
+    secret       BLOB NOT NULL,
+    updated_at   TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS login_credentials (
     login_id     INTEGER PRIMARY KEY REFERENCES logins(id),
     secret       BLOB NOT NULL,       -- encrypted; see crypto.py
@@ -162,7 +167,8 @@ _MIGRATIONS = {
                "skip_other_institutions": "INTEGER NOT NULL DEFAULT 0",
                "open_account_details": "INTEGER NOT NULL DEFAULT 0",
                "sign_in_with": "TEXT NOT NULL DEFAULT 'password'",   # password | google
-               "not_accounts": "TEXT"},    # last 4s the page shows that aren't accounts
+               "not_accounts": "TEXT",     # last 4s the page shows that aren't accounts
+               "statement_kind": "TEXT NOT NULL DEFAULT 'account'"},   # account | capital
     "run_items": {"login_id": "INTEGER", "evidence": "TEXT"},
     "login_attempts": {"login_id": "INTEGER"},
     "runs": {"pid": "INTEGER", "login_ids": "TEXT",     # logins the run covers (JSON list)

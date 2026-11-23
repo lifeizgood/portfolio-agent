@@ -113,6 +113,19 @@ class AccountRows(BaseModel):
     closed: bool = Field(False, description="The portal marks this account as closed")
     category: str | None = Field(None, description="Section heading it is listed under, e.g. Loans")
     held_at: str | None = Field(None, description="Institution the page shows for this account")
+    # A fund on a portal page is valued as of its own date (e.g. last quarter end), which
+    # can be months before the page was captured.
+    as_of_datetime: datetime | None = Field(None, description="This account's own as-of date")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _own_as_of(cls, data):
+        return _as_of_aliases(data)
+
+    @field_validator("as_of_datetime", mode="before")
+    @classmethod
+    def _own_date(cls, v):
+        return None if v in (None, "", "null") else parse_as_of(v)
 
     @field_validator("closed", mode="before")
     @classmethod

@@ -22,8 +22,8 @@ from langgraph.graph import END, START, StateGraph
 from . import config, registry, store
 from .documents import read_text
 from .extractor import ExtractionError, extract
-from .schemas import Extraction, Snapshot
-from .timeutil import now_iso, parse_iso
+from .schemas import Extraction, Holding, Snapshot
+from .timeutil import now_iso, parse_as_of, parse_iso
 from .validator import unlisted_accounts, validate, validate_extraction
 
 MAX_ATTEMPTS = 2   # retry semantics are deferred (spec C2); current behavior kept
@@ -59,6 +59,19 @@ def is_option(h) -> bool:
                 or _OPTION_SYMBOL.match((h.symbol or "").replace(" ", "").upper()))
 
 
+def balance_holdings(ext: Extraction) -> Extraction:
+    """A balance-only account (a card, a loan, a bank account) read with its total but
+    no holdings gets one holding worth that total, named after the account. Done in code
+    so a missing line item doesn't send a correct balance back to the model."""
+    accounts = []
+    for rows in ext.accounts:
+        if not rows.holdings and rows.statement_total is not None:
+            rows = rows.model_copy(update={"holdings": [Holding(
+                description=rows.account, value=rows.statement_total)]})
+        accounts.append(rows)
+    return ext.model_copy(update={"accounts": accounts})
+
+
 def value_sold_options(ext: Extraction) -> Extraction:
     """A sold (written) option is owed: its value is -(contracts x 100 x price per share),
     whatever sign the statement prints for it. Computed here, not left to the model.
@@ -89,6 +102,21 @@ def apply_statement_number(ext: Extraction, text: str, institution: str | None) 
     return ext.model_copy(update={"accounts": [rows]})
 
 
+def apply_row_dates(ext: Extraction, text: str, institution: str | None) -> Extraction:
+    """A portal table that dates each row ("As of Date"): code reads each account's date
+    from its row and it overrides the model's."""
+    from .statement_guides import account_date, guide_for, row_dates
+    dates = row_dates(text, guide_for(institution))
+    if not dates:
+        return ext
+    accounts = []
+    for rows in ext.accounts:
+        d = account_date(rows.account, dates)
+        accounts.append(rows if d is None else
+                        rows.model_copy(update={"as_of_datetime": parse_as_of(d)}))
+    return ext.model_copy(update={"accounts": accounts})
+
+
 def apply_detail_numbers(ext: Extraction, details: list[dict]) -> Extraction:
     """An account's number comes from its own details page, read by code, not from
     the model: the account whose name is the link that was clicked gets that page's
@@ -112,16 +140,17 @@ def _snapshot(ext: Extraction, rows, institution: str, source: str,
               liability: bool = False) -> Snapshot:
     """A liability (loan, card) is owed, so its values are stored negative. An asset
     account keeps each value's own sign: a sold option or margin cash is negative."""
+    as_of = rows.as_of_datetime or ext.as_of_datetime    # a fund's own date, else the page's
     if not liability:
         return Snapshot(institution=institution, account=rows.account,
-                        as_of_datetime=ext.as_of_datetime,
+                        as_of_datetime=as_of,
                         statement_total=rows.statement_total,
                         holdings=list(rows.holdings), source=source)
     holdings = [h.model_copy(update={"value": -abs(h.value), "price": None, "quantity": None})
                 for h in rows.holdings]
     total = rows.statement_total
     return Snapshot(institution=institution, account=rows.account,
-                    as_of_datetime=ext.as_of_datetime,
+                    as_of_datetime=as_of,
                     statement_total=None if total is None else -abs(total),
                     holdings=holdings, source=source)
 
@@ -174,22 +203,26 @@ def build_ingest_graph(model, conn, today=None):
         login = state.get("login")
         inst = login["institution"] if login else state.get("institution")
         playbook = store.get_playbook(conn, inst) if inst else None
-        if state.get("source") == "statement":      # the institution's statement layout
-            from .statement_guides import guide_for
-            guide = guide_for(inst)
-            if guide:
-                playbook = "\n\n".join(x for x in (guide.notes, playbook) if x)
+        from .statement_guides import guide_for
+        guide = guide_for(inst)
+        if guide:   # the institution's statement layout, or its portal page's layout
+            notes = guide.notes if state.get("source") == "statement" else guide.portal_notes
+            playbook = "\n\n".join(x for x in (notes, playbook) if x)
         attempts = state["attempts"] + 1
         try:
             ext = extract(model, state["text"], playbook, state.get("errors") or None,
                           captured_at=state["retrieved_at"] if state.get("source") == "portal" else None,
-                          statement=state.get("source") == "statement")
+                          statement=state.get("source") == "statement",
+                          capital=state.get("source") == "statement" and bool(login)
+                          and login.get("statement_kind") == "capital")
         except ExtractionError as e:
             return {"extraction": None, "errors": [str(e)], "attempts": attempts}
         ext = apply_detail_numbers(ext, state.get("details") or [])
         if state.get("source") == "statement":
             ext = apply_statement_number(ext, state["text"], inst)
-        ext = value_sold_options(ext)
+        else:
+            ext = apply_row_dates(ext, state["text"], inst)
+        ext = value_sold_options(balance_holdings(ext))
         if ext.as_of_datetime is None and state.get("source") == "statement":
             # A statement is dated by its period; the upload time would misdate it.
             return {"extraction": None, "attempts": attempts, "errors": [
@@ -206,7 +239,8 @@ def build_ingest_graph(model, conn, today=None):
         login = state.get("login")
         inst = login["institution"] if login else (ext.institution or state.get("institution") or "")
         errors = validate_extraction(ext) + unlisted_accounts(
-            state["text"], ext, registry.last4s(login.get("not_accounts")) if login else ())
+            state["text"], ext, (registry.last4s(login.get("not_accounts"))
+                                 + registry.set_aside_last4s(conn, login["id"])) if login else ())
         if state.get("source") == "portal":   # V13: a live page's date is about now
             age = parse_iso(state["retrieved_at"]) - ext.as_of_datetime
             if age.days > config.PORTAL_MAX_AGE_DAYS:

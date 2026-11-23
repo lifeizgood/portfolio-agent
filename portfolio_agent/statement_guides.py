@@ -13,6 +13,9 @@ misread. If the marker isn't found, nothing is cut.
 
 import re
 from dataclasses import dataclass
+from datetime import date
+
+from .timeutil import parse_date_text
 
 
 @dataclass(frozen=True)
@@ -23,6 +26,11 @@ class Guide:
     cut_from: str | None = None        # else regex: text from the first match on is cut
     account_number: str | None = None  # regex, group 1: the statement's one account number
     pages: int | None = None           # read only the first N pages (the rest is cut)
+    portal_notes: str | None = None    # how to read the institution's portal page
+    portal_marker: str | None = None   # text on that page: read it as soon as it shows
+    # regex for the header of the portal table's per-row date column ("As of Date"):
+    # code reads each row's date there, overriding the model's
+    portal_date_column: str | None = None
 
 
 ROCKEFELLER = Guide(
@@ -99,9 +107,53 @@ FREC = Guide(
   line shows an opening and a closing balance, use the closing one, never the opening one.
 - Return exactly ONE holding: description "Total priced portfolio", value = that closing
   balance, quantity null, price null. Don't list individual positions.
-- statement_total = the same closing balance. grand_total = null.""")
+- statement_total = the same closing balance. grand_total = null.""",
+    portal_notes="""Frec dashboard (the page after sign-in):
+- Each account listed on the dashboard is its own account. Account name: as shown.
+  account_suffix: the last 4 characters of its account number, if shown, else null.
+- Its value is the account's TOTAL value as shown on the dashboard. Return exactly ONE
+  holding per account: description "Total value", value = that total, quantity null,
+  price null. statement_total = the same number. Don't list individual positions.
+- grand_total = the overall total for all accounts, if the dashboard shows one, else null.""")
 
-GUIDES = (ROCKEFELLER, SCHWAB, FREC)
+STRATEGIC_PARTNERS = Guide(
+    keywords=("strategic partners", "blackstone"),
+    notes="",
+    portal_marker="Performance Summary",
+    portal_date_column=r"as of(?: date)?",
+    portal_notes="""Strategic Partners (Blackstone) investor portal:
+- Read only the "Performance Summary (USD)" table. Each row is one fund investment, and
+  each fund is its own account. Account name: the fund's name in that row. account_suffix:
+  null.
+- The fund's value is its "Unrealized Value" column: what is still invested. Never use
+  "Current Value" or "Total Current Value" (they add "Realized Value", money already paid
+  out to the investor), and never Realized Value, Commitment, Contributions, Distributions,
+  Net Gain, IRR or multiple columns.
+- The page text ends with each table again, one row per line ("cell | cell | ..."):
+  use those rows to tell the columns apart, and the header row to find Unrealized Value
+  and As of. A row whose first cell is "Total" is the total row.
+- Give each account its own "as_of" = the date in that row's "As of Date" column, the
+  table's last column, e.g. "Jun-30-2026" -> "2026-06-30" (YYYY-MM-DD).
+  If the rows show no date, use the "As of" date shown for the whole table (it may be
+  listed under "Values shown in fields and dropdowns"). The page's top-level "as_of" is
+  null: the values are as of each fund's own date.
+- Give exactly ONE holding per fund: description = the fund name, value = the Unrealized
+  Value, quantity null, price null. statement_total = the same Unrealized Value (never the
+  fund's current value).
+- grand_total = "Total Unrealized Value" (the total of the Unrealized Value column), never
+  "Total Current Value". A total row is not an account.""")
+
+STAR_MOUNTAIN = Guide(
+    keywords=("star mountain",),
+    notes="""Star Mountain capital statement:
+- ONE fund per statement. Account name: the fund's name as shown on the statement.
+- as_of = the date shown at the TOP of the statement (the "as of" or period-end date).
+- The fund's value is the "Ending Balance" for the period (the current period column,
+  never year-to-date or inception-to-date, never the beginning balance).
+- One holding: description = the fund name, value = that Ending Balance; statement_total =
+  the same number.""")
+
+GUIDES = (ROCKEFELLER, SCHWAB, FREC, STRATEGIC_PARTNERS, STAR_MOUNTAIN)
 
 
 def guide_for(institution: str | None) -> Guide | None:
@@ -130,6 +182,57 @@ def trim(text: str, guide: Guide | None) -> str:
     if end is None:
         return text
     return text[:end].rstrip() + "\n[... activity, footnotes and disclosures left out ...]"
+
+
+def _name_key(s: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", (s or "").lower()))
+
+
+def _cells(line: str) -> list[str]:
+    """A table row from the captured text: "cell | cell" rows, or the tab-separated
+    cells of the page's visible text."""
+    sep = " | " if " | " in line else "\t" if "\t" in line else None
+    return [c.strip() for c in line.split(sep)] if sep else []
+
+
+def row_dates(text: str, guide: Guide | None) -> dict[str, date]:
+    """Each table row's own date, read by code from the column whose header matches the
+    guide's portal_date_column: {row name (lowercased words): date}. The row's name is
+    its first cell with a letter in it. Rows without a date there (a total) are left out."""
+    if not guide or not guide.portal_date_column:
+        return {}
+    head = re.compile(rf"^{guide.portal_date_column}$", re.I)
+    out: dict[str, date] = {}
+    col = width = None
+    for line in text.splitlines():
+        cells = _cells(line)
+        if len(cells) < 2:
+            continue
+        hits = [i for i, c in enumerate(cells) if head.match(c)]
+        if hits:
+            col, width = hits[0], len(cells)
+            continue
+        if col is None:
+            continue
+        # the same column counted from the start, or from the end when a row has an
+        # extra (expand/collapse) cell at the front
+        for i in (col, len(cells) - (width - col)):
+            d = parse_date_text(cells[i]) if 0 <= i < len(cells) else None
+            if d:
+                name = next((c for c in cells if re.search(r"[A-Za-z]", c)), "")
+                if _name_key(name):
+                    out.setdefault(_name_key(name), d)
+                break
+    return out
+
+
+def account_date(account: str, dates: dict[str, date]) -> date | None:
+    """The date read for this account's row; else the one date every row shows."""
+    if not dates:
+        return None
+    if (d := dates.get(_name_key(account))) is not None:
+        return d
+    return next(iter(set(dates.values()))) if len(set(dates.values())) == 1 else None
 
 
 def statement_number(text: str, guide: Guide | None) -> str | None:

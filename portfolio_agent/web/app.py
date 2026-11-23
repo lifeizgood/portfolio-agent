@@ -23,6 +23,7 @@ from ..runner import run_logins, select_logins
 from ..timeutil import now, parse_iso
 
 STATIC = Path(__file__).parent / "static"
+SECTIONS = {"dashboard", "inbox", "accounts", "debug"}   # tabs with their own address
 EVIDENCE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".txt": "text/plain",
                   ".json": "text/plain", ".pdf": "application/pdf",
                   ".html": "text/plain"}   # portal HTML is shown as text, never rendered
@@ -30,7 +31,12 @@ EVIDENCE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".txt": "text/plain
 
 class CredentialsIn(BaseModel):
     username: str
-    password: str
+    password: str = ""     # blank for "Sign in with Google": the username is the Google account
+
+
+class EmailReaderIn(BaseModel):
+    address: str
+    app_password: str
 
 
 class AnswerIn(BaseModel):
@@ -252,6 +258,33 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
             raise HTTPException(404, str(e))
         return {"ok": True}
 
+    @app.get("/api/email-reader")
+    def email_reader(c=Depends(conn)):
+        from .. import email_codes
+        s = email_codes.get_settings(c)
+        return {"configured": bool(s), "address": s["address"] if s else None}
+
+    @app.put("/api/email-reader")
+    def put_email_reader(body: EmailReaderIn, c=Depends(conn)):
+        """Checks the Gmail sign-in first (reads no messages), then saves it encrypted."""
+        from .. import email_codes
+        settings = {"address": body.address.strip(),
+                    "app_password": "".join(body.app_password.split())}
+        try:
+            if "@" not in settings["address"] or len(settings["app_password"]) < 8:
+                raise ValueError("Enter the Gmail address and its 16-letter app password.")
+            email_codes.check(settings)
+            email_codes.save_settings(c, settings["address"], settings["app_password"])
+        except (ValueError, email_codes.EmailUnavailable) as e:
+            raise HTTPException(400, str(e))
+        return {"ok": True}
+
+    @app.delete("/api/email-reader")
+    def delete_email_reader(c=Depends(conn)):
+        from .. import email_codes
+        email_codes.clear_settings(c)
+        return {"ok": True}
+
     @app.get("/api/logins/{lid}/credentials")
     def reveal_credentials(lid: int, c=Depends(conn)):
         """The eye icon (spec D18). Localhost only; see module docstring."""
@@ -321,8 +354,9 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
         lg = registry.get_login(c, lid)
         if not lg:
             raise HTTPException(404)
-        if lg["status"] != "active" or lg["access_method"] != "browser":
-            raise HTTPException(400, "Only an active browser login can be refreshed.")
+        if lg["status"] != "active" or not lg["refresh_supported"]:
+            raise HTTPException(400, "Refresh isn't supported for this login; upload its "
+                                "statements instead.")
         return start_refresh(c, [lid])
 
     # --- uploaded statements ----------------------------------------------------
@@ -477,6 +511,18 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
         elif config.KILL_FILE.exists():
             config.KILL_FILE.unlink()
         return {"kill_switch": config.KILL_FILE.exists()}
+
+    @app.get("/{section}", include_in_schema=False)
+    @app.get("/{section}/", include_in_schema=False)
+    def section_page(section: str):
+        """Each part of the dashboard has its own address (/inbox, /accounts, ...): the
+        same page, which opens that tab. Other paths fall through to the static files."""
+        if section not in SECTIONS:
+            target = STATIC / section
+            if target.is_file():
+                return FileResponse(target)
+            raise HTTPException(404)
+        return FileResponse(STATIC / "index.html")
 
     app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")
     return app
