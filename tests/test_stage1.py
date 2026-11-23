@@ -566,7 +566,7 @@ def test_refresh_one_login_from_accounts_tab(client):
     run = client.post(f"/api/logins/{a}/refresh", headers=H).json()
     items = client.get(f"/api/runs/{run['run_id']}").json()["items"]
     assert [i["login_id"] for i in items] == [a]
-    assert client.get("/api/logins").json()[0]["last_fetched"] is not None
+    assert client.get("/api/logins").json()[0]["last_updated"] is not None
     # Refresh not supported: no Refresh for it; its statements are uploaded instead.
     assert client.post(f"/api/logins/{b}/refresh", headers=H).status_code == 400
     assert client.post("/api/logins/999/refresh", headers=H).status_code == 404
@@ -2048,3 +2048,25 @@ def test_option_cleanup_rules():
     assert any("Refresh is supported only" in e for e in registry.check(
         registry.LoginIn(name="x", institution="x", access_method="upload", refresh_supported=True)))
     assert not registry.LoginIn(**base).refresh_supported      # off until you tick it
+
+
+def test_last_updated_counts_values_approved_after_review(conn):
+    """A login whose values arrived by approving an Inbox review (no 'stored' run)
+    still shows when it was last updated."""
+    lid = add_login(conn, name="Example CU", institution="Example CU", access_method="upload",
+                    login_url=None, allowed_domains=None, cadence="monthly")
+    assert registry.get_login(conn, lid)["last_updated"] is None
+    aid = active_account(conn, lid, name="Savings", suffix="1111")
+    store.write_snapshot(conn, snap(institution="Example CU", account="Savings").model_copy(
+        update={"account_id": aid}), retrieved_at="2026-11-13T03:45:00+00:00")
+    assert registry.get_login(conn, lid)["last_updated"] == "2026-11-13T03:45:00+00:00"
+
+
+def test_as_of_one_day_ahead_is_accepted():
+    """Portals date values in Eastern time, which can be tomorrow here: accept today + 1,
+    reject anything later."""
+    from portfolio_agent.validator import validate
+    today = date(2026, 11, 22)
+    future = lambda r: [e for e in r.errors if "in the future" in e]
+    assert not future(validate(snap(as_of="2026-11-23T01:00:00"), today=today))
+    assert future(validate(snap(as_of="2026-11-24T09:00:00"), today=today))

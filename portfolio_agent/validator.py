@@ -60,16 +60,15 @@ def validate(snap: Snapshot, previous: Snapshot | None = None,
 
     # V5 as-of not in the future. (V6, "not earlier than the last value", was
     # removed: out-of-order ingestion is valid, spec C4.)
+    # Up to one day ahead is accepted: portals often date values in Eastern time (or
+    # with the next business day), which can read as tomorrow here.
     if isinstance(today, datetime):
-        late_limit = today + timedelta(minutes=config.FUTURE_SLACK_MIN)
-        if snap.as_of_datetime > late_limit:
-            errors.append(f"As-of {snap.as_of_datetime:%Y-%m-%d %H:%M} is in the future.")
+        today_d = today.astimezone().date()
     else:
         today_d = today or now().astimezone().date()
-        if snap.as_of_date > today_d:
-            errors.append(f"As-of date {snap.as_of_date} is in the future.")
-        elif today is None and snap.as_of_datetime > now() + timedelta(minutes=config.FUTURE_SLACK_MIN):
-            errors.append(f"As-of {snap.as_of_datetime:%Y-%m-%d %H:%M} is in the future.")
+    latest_ok = today_d + timedelta(days=config.FUTURE_DAYS_OK)
+    if snap.as_of_date > latest_ok:
+        errors.append(f"As-of date {snap.as_of_date} is in the future.")
 
     # V8 continuity against the nearest earlier value. A big unexplained move may
     # well be real, so it is held for approval rather than rejected (spec C6:

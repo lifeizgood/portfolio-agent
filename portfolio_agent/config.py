@@ -76,7 +76,7 @@ PAGE_MAX_CHARS = int(os.getenv("PA_PAGE_MAX_CHARS", "80000"))
 SUM_TOLERANCE = float(os.getenv("PA_SUM_TOLERANCE", "0.01"))     # 1% of total
 VALUE_TOLERANCE = float(os.getenv("PA_VALUE_TOLERANCE", "0.02"))  # qty*price vs value
 LARGE_MOVE = float(os.getenv("PA_LARGE_MOVE", "0.25"))           # hold >25% unexplained moves
-FUTURE_SLACK_MIN = 10
+FUTURE_DAYS_OK = 1      # an as-of date up to this many days after today is accepted (time zones)
 # A live portal page shows current values: its as-of must be within this many days of
 # when the page was captured (covers weekends and market holidays).
 PORTAL_MAX_AGE_DAYS = int(os.getenv("PA_PORTAL_MAX_AGE_DAYS", "5"))   # clock skew allowed before an as-of counts as "in the future"

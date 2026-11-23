@@ -283,6 +283,13 @@ def list_logins(conn) -> list[dict]:
     return [_login_extras(conn, dict(r)) for r in conn.execute("SELECT * FROM logins ORDER BY name")]
 
 
+def _utc(t: str):
+    """ISO time as an aware UTC datetime, for comparing times stored in different forms."""
+    from datetime import datetime, timezone
+    d = datetime.fromisoformat(t.replace("Z", "+00:00"))
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
 def _login_extras(conn, lg: dict) -> dict:
     lg["refresh_supported"] = bool(lg.pop("holds_public"))
     lg["skip_other_institutions"] = bool(lg.get("skip_other_institutions"))
@@ -299,9 +306,14 @@ def _login_extras(conn, lg: dict) -> dict:
         p = latest.get(a["id"])
         a["balance"] = p["total"] if p else None
         a["balance_as_of"] = p["as_of_datetime"] if p else None
+    # Last updated: the newest successful read, or the newest values stored for one of
+    # its accounts (values approved from the Inbox after a review count too).
     r = conn.execute("SELECT MAX(finished_at) AS t FROM run_items WHERE login_id=?"
-                     " AND outcome IN ('stored','held','mixed')", (lg["id"],)).fetchone()
-    lg["last_fetched"] = r["t"] if r else None
+                     " AND outcome IN ('stored','held','mixed','unchanged')", (lg["id"],)).fetchone()
+    s = conn.execute("SELECT MAX(s.retrieved_at) AS t FROM snapshots s JOIN accounts a"
+                     " ON a.id = s.account_id WHERE a.login_id=?", (lg["id"],)).fetchone()
+    times = [t for t in ((r["t"] if r else None), (s["t"] if s else None)) if t]
+    lg["last_updated"] = max(times, key=_utc) if times else None
     return lg
 
 

@@ -460,8 +460,8 @@ async function loadAccounts() {
     const canRefresh = lg.status === "active" && lg.refresh_supported;
     const canUpload = lg.status === "active";
     tr.innerHTML = `<td class="clip" title="${esc(lg.name)}">${esc(lg.name)}</td><td class="clip" title="${esc(lg.institution)}">${esc(lg.institution)}</td><td>${lg.accounts.length}</td>
-      <td>${esc(lg.cadence)}</td><td>${lg.has_credentials ? "yes" : "no"}</td>
-      <td>${when(lg.last_fetched)}</td>
+      <td>${esc(lg.cadence)}</td><td>${lg.refresh_supported ? "Yes" : "No"}</td>
+      <td>${when(lg.last_updated)}</td>
       <td class="row"><button data-act="edit">Edit</button>
         ${!lg.refresh_supported
           ? `<button class="primary" data-act="upload" data-idle="Upload statements" data-lid="${lg.id}" data-can="${canUpload ? 1 : 0}" ${canUpload ? "" : "disabled"} title="Upload this month's statement PDFs: one per account or one consolidated">Upload statements</button><input type="file" accept=".pdf,application/pdf" multiple hidden>`

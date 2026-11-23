@@ -447,7 +447,7 @@ The validator is deterministic code with no LLM. A snapshot is accepted only if 
 | V2 | **Sum to total** | Holding rows sum to the account total shown on the page or statement | ✅ 1% tolerance (`PA_SUM_TOLERANCE`); a missing total is a warning |
 | V3 | **Quantity × price** | qty × price ≈ value for each holding, using the portal's own numbers. For an option, qty × price × 100 (one contract is 100 shares). **No market-feed check** [U C3] | ✅ 2% tolerance; options × 100 |
 | V4 | **Non-negative values** | A negative holding in an asset account is a likely sign misread, except a **sold option** or **margin cash**, allowed when the account has a stated total for V2 to check against. A sold option's value is set in code to −(contracts × 100 × price), whatever sign the statement prints [U, 2026-11-12] | ✅ |
-| V5 | **As-of not in the future** | | ✅ |
+| V5 | **As-of not in the future** | An as-of date up to one day after today is accepted: portals often date values in Eastern time, which can read as tomorrow [U, 2026-11-22] | ✅ |
 | ~~V6~~ | ~~As-of not earlier than the last accepted value~~ | **Removed.** Out-of-order ingestion is valid [U C4] | ✅ removed |
 | V7 | **Roll-forward** | Each capital statement reconciles within itself, and with the previous period (§5.2) [6.1, U D5] | ❌ not implemented; no roll-forward schema |
 | V8 | **Continuity** | The change from the **nearest earlier accepted value** is explainable [U D19]; a large unexplained move is flagged or held [2.1, 6.1]. Market data looked up by ticker may serve as the benchmark [U C14]. Outcome (C6) and threshold and benchmark (D3) are open | ⚠️ a move above 25% (`PA_LARGE_MOVE`) is held for approval, not rejected; market move is an optional input; the benchmark (D3) is still open |
