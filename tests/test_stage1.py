@@ -559,15 +559,18 @@ def test_holding_value_shows_at_its_own_date_and_persists(conn):
 
 
 def test_refresh_one_login_from_accounts_tab(client):
-    mk = lambda n, rs: {"name": n, "institution": n, "login_url": "https://www.mymerrill.com",
-                        "allowed_domains": "mymerrill.com, ml.com", "refresh_supported": rs}
-    a = client.post("/api/logins", json=mk("Merrill Lynch", True), headers=H).json()["id"]
-    b = client.post("/api/logins", json=mk("Other Bank", False), headers=H).json()["id"]
+    mk = lambda n, how: {"name": n, "institution": n, "login_url": "https://www.mymerrill.com",
+                         "allowed_domains": "mymerrill.com, ml.com", "access_method": how}
+    a = client.post("/api/logins", json=mk("Merrill Lynch", "browser"), headers=H).json()["id"]
+    b = client.post("/api/logins", json=mk("Other Bank", "upload"), headers=H).json()["id"]
+    # Refresh supported follows the access method: every Browser login, no other.
+    rs = {lg["id"]: lg["refresh_supported"] for lg in client.get("/api/logins").json()}
+    assert rs == {a: True, b: False}
     run = client.post(f"/api/logins/{a}/refresh", headers=H).json()
     items = client.get(f"/api/runs/{run['run_id']}").json()["items"]
     assert [i["login_id"] for i in items] == [a]
     assert client.get("/api/logins").json()[0]["last_updated"] is not None
-    # Refresh not supported: no Refresh for it; its statements are uploaded instead.
+    # Upload logins have no Refresh; their statements are uploaded instead.
     assert client.post(f"/api/logins/{b}/refresh", headers=H).status_code == 400
     assert client.post("/api/logins/999/refresh", headers=H).status_code == 404
 
@@ -2044,10 +2047,6 @@ def test_option_cleanup_rules():
     for t in ("wealth_management", "other"):
         with pytest.raises(ValueError):
             registry.AccountEdit(display_name="Alex", account_type=t)
-    assert "refresh supported" not in " ".join(registry.check(registry.LoginIn(**base, refresh_supported=True))).lower()
-    assert any("Refresh is supported only" in e for e in registry.check(
-        registry.LoginIn(name="x", institution="x", access_method="upload", refresh_supported=True)))
-    assert not registry.LoginIn(**base).refresh_supported      # off until you tick it
 
 
 def test_last_updated_counts_values_approved_after_review(conn):

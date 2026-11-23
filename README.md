@@ -30,7 +30,7 @@ python -m portfolio_agent.cli serve      # dashboard at http://127.0.0.1:8765 (e
    - Name, institution and login page URL (Merrill: `https://www.mymerrill.com`).
    - Allowed domains default to the login page's domain. Add any domain the portal sends you to, comma-separated (Merrill: `mymerrill.com, ml.com`).
    - Optional login steps: the holdings page URLs (one per line) that together show every account. Leave them blank and the fetcher detects the login fields and uses the local LLM to find the holdings page.
-   - Tick **Refresh supported** for logins the app can sign in to. Only those get a **Refresh** button and are part of the Dashboard's Refresh; every other login shows **Upload statements**. Access methods API, Email statement and Manual appear greyed out until they're built.
+   - Every login with access method **Browser** gets a **Refresh** button and is part of the Dashboard's Refresh (the Refresh supported column shows Yes); every other login shows **Upload statements**. Access methods API, Email statement and Manual appear greyed out until they're built.
 2. **Save the username and password.** They're encrypted with a key in `~/.portfolio-agent/secret.key` (mode 600). Use the eye icon to view them.
 3. **Sign in by hand once** so the portal remembers this device:
    `python -m portfolio_agent.cli open-browser <login id>`
@@ -45,7 +45,7 @@ python -m portfolio_agent.cli serve      # dashboard at http://127.0.0.1:8765 (e
    - If a page is rejected because it shows a number that isn't an account (e.g. a member number), press **Accept accounts read** on the Inbox item. The number is saved under the login's **Numbers that aren't accounts**, and the accounts read are checked again and held for your approval.
 5. **Nightly run:** `python -m portfolio_agent.cli nightly`. Schedule it with launchd. Each login is limited to 2 logins per night.
 6. **Institutions without daily access: upload statements.**
-   - Add a login with access method **Upload statements** and cadence **Monthly**. It needs no URL or password; leave Refresh supported unticked, and Refresh and the nightly run skip it.
+   - Add a login with access method **Upload statements** and cadence **Monthly**. It needs no URL or password; Refresh and the nightly run skip it.
    - Each month, press **Upload** on the login and pick the PDFs: one per account, or one consolidated statement.
    - Each file is read like a portal page. Its accounts are checked and stored, or held in the Inbox. A statement is dated by the closing date of its period.
    - Uploading the same statement again is safe: it's ignored once it has been read correctly, and read again if it wasn't.

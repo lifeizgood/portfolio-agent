@@ -53,9 +53,6 @@ class LoginIn(BaseModel):
     sign_in_with: str = "password"
     statement_kind: str = "account"
     cadence: str = "nightly"
-    # "Refresh supported": the app can sign in and fetch this login, so it gets a Refresh
-    # button and is part of the dashboard's Refresh. Browser logins only.
-    refresh_supported: bool = False
     status: str = "active"
     closed_on: str | None = None
     # Rules for the accounts this login's pages list
@@ -186,9 +183,6 @@ def check(login: LoginIn) -> list[str]:
             errs.append(f"{u} is not inside the allowed domains {doms}.")
     if login.status == "closed" and not login.closed_on:
         errs.append("A closed login needs a close date.")
-    if login.refresh_supported and login.access_method != "browser":
-        errs.append("Refresh is supported only for browser logins; statements for this "
-                    "login are uploaded.")
     return errs
 
 
@@ -214,7 +208,7 @@ def save_login(conn, login: LoginIn, login_id: int | None = None) -> int:
         raise ValueError(" ".join(errs))
     data = login.model_dump()
     data["allowed_domains"] = ",".join(domains(data)) or None
-    data["holds_public"] = int(bool(data.pop("refresh_supported")))   # stored in holds_public
+    data["holds_public"] = int(data["access_method"] == "browser")   # = refresh supported
     data["skip_other_institutions"] = int(bool(data["skip_other_institutions"]))
     data["open_account_details"] = int(bool(data["open_account_details"]))
     vals = [data[c] for c in _LOGIN_COLS]
@@ -291,7 +285,9 @@ def _utc(t: str):
 
 
 def _login_extras(conn, lg: dict) -> dict:
-    lg["refresh_supported"] = bool(lg.pop("holds_public"))
+    lg.pop("holds_public", None)
+    # Every browser login can be refreshed; other logins upload statements.
+    lg["refresh_supported"] = lg.get("access_method") == "browser"
     lg["skip_other_institutions"] = bool(lg.get("skip_other_institutions"))
     lg["open_account_details"] = bool(lg.get("open_account_details"))
     lg["has_credentials"] = conn.execute(

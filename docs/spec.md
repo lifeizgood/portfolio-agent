@@ -333,13 +333,13 @@ The user maintains the registry through the UI; agents only read it [U D1].
 | Statement sender | Full email address of the statement sender | Mail filter |
 | PDF password source | Sender of the password email, or a password the user stores [U D8] | Statement fetcher |
 | Update cadence | Nightly; **monthly** (stale 45 days after the last statement); or **quarterly** with a 2–4 month lag (stale 120 days after the last statement, provisional pending D10) | Orchestrator; staleness check |
-| Refresh supported | Yes / no (browser logins only). Yes: the login has a Refresh button and is part of the Dashboard's Refresh; no: it shows Upload statements [U, 2026-11-22; replaces "holds public securities"] | Refresh |
+| Refresh supported | Not a setting: yes for every Browser login, no otherwise. Yes: the login has a Refresh button and is part of the Dashboard's Refresh; no: it shows Upload statements [U, 2026-11-22; replaces "holds public securities"; tied to Browser access, U 2026-11-23] | Refresh |
 | Status | Active, or closed with a close date | Orchestrator; completeness; history |
 
 - **Every edit is checked in code:** the credential exists, the portal domain is added to the allowlist, and the sender is a full email address [2.1].
 - **Agents can suggest, not change.** A new sender or portal address becomes an inbox suggestion. Only the user approves registry changes [2.1, 6.1].
 
-*Today's code (`registry.py`, Accounts & logins in the dashboard): logins with URL, domains, 2FA method, cadence (nightly, monthly), access method (browser or upload), refresh supported and encrypted credentials; accounts with display name, type, category, status (pending, active, excluded, ignored, closed), debt flag and owner; login rules. Not yet: statement sender, PDF password source, quarterly cadence, and registry suggestions from agents.*
+*Today's code (`registry.py`, Accounts & logins in the dashboard): logins with URL, domains, 2FA method, cadence (nightly, monthly), access method (browser or upload; browser logins can be refreshed) and encrypted credentials; accounts with display name, type, category, status (pending, active, excluded, ignored, closed), debt flag and owner; login rules. Not yet: statement sender, PDF password source, quarterly cadence, and registry suggestions from agents.*
 
 ### 5.5 Credentials [U C9, D8]
 
