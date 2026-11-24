@@ -99,3 +99,6 @@ th[aria-sort=descending] button.sort::after { content: "▼"; opacity: 1; }
 .controls .basis { display: flex; gap: 6px; align-items: center; color: var(--muted); }
 td .sub { color: var(--muted); font-size: 12px; }
 #owner-list .share-form { margin: 8px 0 0; }
+
+/* Demo build only (branch blurred-for-demo): dollar amounts are blurred for screen recordings. */
+.demo-blur { filter: blur(max(6px, .5em)); user-select: none; }   /* big amounts blur more */

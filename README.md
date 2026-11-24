@@ -1,5 +1,7 @@
 # Personal Portfolio Agent: starter repo
 
+> **Demo build (branch `blurred-for-demo`):** dollar amounts in the dashboard are blurred for screen recordings (`web/static/demo-blur.js`), including the chart's axis and tooltips; other numbers stay readable. Only the display changes. Not for daily use.
+
 CMU agentic AI capstone. Runs locally on a Mac with Hugging Face models,
 LangChain and LangGraph. Your financial data never leaves the machine.
 
