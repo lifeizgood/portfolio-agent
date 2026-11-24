@@ -202,8 +202,8 @@ def save_login(conn, login: LoginIn, login_id: int | None = None) -> int:
     same = conn.execute("SELECT id FROM logins WHERE name=? COLLATE NOCASE AND id IS NOT ?",
                         (login.name.strip(), login_id)).fetchone()
     if same:
-        errs.append(f"A login named {login.name.strip()!r} already exists. Edit that one, or "
-                    "give this login another name.")
+        errs.append(f"A login labelled {login.name.strip()!r} already exists. Edit that one, or "
+                    "give this login another label.")
     if errs:
         raise ValueError(" ".join(errs))
     data = login.model_dump()

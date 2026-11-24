@@ -40,6 +40,7 @@ python -m portfolio_agent.cli serve      # dashboard at http://127.0.0.1:8765 (e
    - The accounts must add up to the page's total for all accounts; if one is missing, the reading is rejected.
    - Each new account appears under its login as **pending**, and its first value is held in the **Inbox**. Check it with **View Source** (screenshot, page text, page HTML), then approve it.
    - Rename an account, change its type, or set it to **ignored** under Accounts & logins. A page that still lists an ignored account isn't held for missing it, and a card or loan read with only its balance is stored as that balance.
+   - The Dashboard's **Accounts** table filters by each column and sorts by each column: click a heading for ascending, again for descending, a third time for the original order (empty values go last). Filters and sort are remembered in this browser.
    - If the portal asks for a verification code, the inbox asks you for it.
    - If the portal shows a **CAPTCHA**, the fetcher's window comes to the front and the Inbox says so. Solve it there; the run carries on by itself (it waits up to 5 minutes, `PA_CAPTCHA_WAIT`). The fetcher never answers a CAPTCHA itself.
    - If a page is rejected because it shows a number that isn't an account (e.g. a member number), press **Accept accounts read** on the Inbox item. The number is saved under the login's **Numbers that aren't accounts**, and the accounts read are checked again and held for your approval.

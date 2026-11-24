@@ -326,6 +326,7 @@ The user maintains the registry through the UI; agents only read it [U D1].
 | Field | Records | Used by |
 |---|---|---|
 | Display name | e.g. "Schwab joint brokerage" | Dashboard, summary, Q&A |
+| Label | A login's own name, e.g. "BofA – family"; the Dashboard's Accounts table shows it (not the institution) [U, 2026-11-23] | Display |
 | Institution, account type | Brokerage / retirement / private fund / bank / loan / credit card | Grouping; cadence |
 | Access method | Browser or **upload**; API, email statement and manual are shown greyed out and can't be chosen until built [U, 2026-11-22]. Upload: the user uploads monthly PDF statements in the dashboard, for institutions whose portal can't be read daily; nightly runs and Refresh skip these logins. Chosen by the user; the system doesn't decide [U D1, 2026-11-12] | Orchestrator |
 | Login mechanism | Portal URL, credential reference, and the login steps the user enters (Stage 1) [U]. **Sign in with:** username and password, or **Google** (the site's "Sign in with Google"; the user signs in to Google by hand once) [U, 2026-11-12] | Fetcher; browser allowlist |

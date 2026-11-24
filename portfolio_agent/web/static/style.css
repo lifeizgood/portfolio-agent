@@ -86,6 +86,11 @@ table.fixed { table-layout: fixed; }
 table.fixed td { overflow: hidden; word-break: break-word; }
 table.fixed td.clip { white-space: nowrap; text-overflow: ellipsis; }
 #login-accounts tr.dirty td { background: var(--pill-warn); }
+button.sort { border: none; background: none; padding: 0; font: inherit; color: inherit; cursor: pointer; }
+button.sort:hover { color: var(--text); text-decoration: underline; }
+button.sort::after { content: "↕"; margin-left: 4px; opacity: .35; }
+th[aria-sort=ascending] button.sort::after { content: "▲"; opacity: 1; }
+th[aria-sort=descending] button.sort::after { content: "▼"; opacity: 1; }
 #positions tr.filters th { padding: 4px 8px 8px; }
 #positions tr.filters input, #positions tr.filters select { width: 100%; min-width: 0; font-size: 12px; padding: 3px 6px; }
 #positions tr.filters input.bad { border-color: var(--bad); }

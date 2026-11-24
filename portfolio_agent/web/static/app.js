@@ -191,7 +191,7 @@ async function loadPositions() {
     const share = !p.share_pct ? "" : `<div class="sub">${basis === "full"
       ? `your ${num(p.share_pct)}%: ${money(p.total)}` : `${num(p.share_pct)}% of ${money(p.full_total)}`}</div>`;
     tr.innerHTML = `<td>${esc(p.account)}${p.owner_name ? `<div class="sub">${esc(p.owner_name)}</div>` : ""}</td>
-      <td>${esc(p.login_name || p.institution)}</td>
+      <td>${esc(p.login_name || "")}</td>
       <td><span class="pill ${esc(p.status)}">${esc(p.status.replace("_", " "))}</span></td>
       <td class="num">${money(p.shown)}${share}</td><td>${p.as_of_datetime ? when(p.as_of_datetime) : "–"}</td>
       <td>${when(p.retrieved_at)}</td>
@@ -208,8 +208,49 @@ async function loadPositions() {
   sel.innerHTML = `<option value="">All</option>` + statuses.map((s) =>
     `<option value="${esc(s)}">${esc(s.replace("_", " "))}</option>`).join("");
   sel.value = statuses.includes(cur) ? cur : "";
+  sortPositions();
   filterPositions();
 }
+
+// Sorting the Accounts table: click a heading for ascending, again for descending, a
+// third time for the original order. Empty values always go last. Remembered per browser.
+const POS_SORT_KEY = "positionSort";
+let posSort = { key: "", dir: 1 };
+try { posSort = JSON.parse(localStorage.getItem(POS_SORT_KEY) || "null") || posSort; } catch {}
+const POS_SORT_VALUE = {
+  account: (p) => p.account, login: (p) => p.login_name, status: (p) => p.status,
+  value: (p) => p.shown, asof: (p) => p.as_of_datetime && Date.parse(p.as_of_datetime),
+  retrieved: (p) => p.retrieved_at && Date.parse(p.retrieved_at),
+};
+function sortPositions() {
+  const tb = $("#positions tbody");
+  const rows = [...tb.querySelectorAll("tr")].filter((tr) => tr._p);
+  rows.forEach((tr, i) => { if (tr._order == null) tr._order = i; });
+  const get = POS_SORT_VALUE[posSort.key];
+  rows.sort((a, b) => {
+    if (!get) return a._order - b._order;
+    const x = get(a._p), y = get(b._p);
+    const ex = x == null || x === "" || Number.isNaN(x), ey = y == null || y === "" || Number.isNaN(y);
+    if (ex || ey) return ex && ey ? a._order - b._order : ex ? 1 : -1;   // empty last
+    const c = typeof x === "string" ? x.localeCompare(y, undefined, { sensitivity: "base", numeric: true }) : x - y;
+    return c * posSort.dir || a._order - b._order;
+  });
+  rows.forEach((tr) => tb.appendChild(tr));
+  document.querySelectorAll("#positions button.sort").forEach((b) => {
+    const on = b.dataset.sort === posSort.key;
+    const th = b.closest("th");
+    if (on) th.setAttribute("aria-sort", posSort.dir > 0 ? "ascending" : "descending");
+    else th.removeAttribute("aria-sort");
+    b.title = on ? (posSort.dir > 0 ? "Sorted ascending; click for descending" : "Sorted descending; click for the original order")
+      : "Sort by this column";
+  });
+}
+document.querySelectorAll("#positions button.sort").forEach((b) => b.addEventListener("click", () => {
+  const k = b.dataset.sort;
+  posSort = posSort.key !== k ? { key: k, dir: 1 } : posSort.dir > 0 ? { key: k, dir: -1 } : { key: "", dir: 1 };
+  try { localStorage.setItem(POS_SORT_KEY, JSON.stringify(posSort)); } catch {}
+  sortPositions();
+}));
 
 // Column filters on the Accounts table. Value accepts >1000, <0, >=500, =0, 1000..5000
 // (a plain number means "at least"). Dates filter by how recent they are.
@@ -246,7 +287,7 @@ function filterPositions() {
   for (const tr of document.querySelectorAll("#positions tbody tr")) {
     const p = tr._p; if (!p) continue;
     all++;
-    const ok = has(`${p.account} ${p.owner_name || ""}`, f.account) && has(p.login_name || p.institution, f.login)
+    const ok = has(`${p.account} ${p.owner_name || ""}`, f.account) && has(p.login_name, f.login)
       && (!f.status || p.status === f.status) && (vt === null || vt(p.shown))
       && asof(p.as_of_datetime) && got(p.retrieved_at);
     tr.hidden = !ok;
