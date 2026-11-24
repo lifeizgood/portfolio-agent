@@ -7,8 +7,10 @@ every state-changing request needs the X-PA-Client header, which a page on
 another origin can't send without a CORS preflight that this server never grants.
 """
 
+import logging
 import threading
-from datetime import date
+import time
+from datetime import date, datetime
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -17,10 +19,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .. import config, registry, series, store
+from .. import config, registry, schedule, series, store
 from ..ingest_graph import accept_review, approve_held
 from ..runner import run_logins, select_logins
 from ..timeutil import now, parse_iso
+
+log = logging.getLogger(__name__)
 
 STATIC = Path(__file__).parent / "static"
 SECTIONS = {"dashboard", "inbox", "accounts", "debug"}   # tabs with their own address
@@ -47,6 +51,11 @@ class OwnerNameIn(BaseModel):
     name: str
 
 
+class DailyRefreshIn(BaseModel):
+    enabled: bool = True
+    time: str
+
+
 class KillIn(BaseModel):
     on: bool
 
@@ -59,7 +68,7 @@ _START_LOCK = threading.Lock()
 
 
 def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
-               run_in_thread: bool = True) -> FastAPI:
+               run_in_thread: bool = True, scheduler: bool = False) -> FastAPI:
     app = FastAPI(title="Portfolio Agent", docs_url=None, redoc_url=None)
     app.add_middleware(TrustedHostMiddleware,
                        allowed_hosts=["127.0.0.1", "localhost", "testserver"])
@@ -104,7 +113,8 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
                 "net_worth_full": sum(p["full_total"] for p in active),  # whole accounts
                 "has_part_owned": any(p["share_pct"] for p in active),
                 "latest_retrieval": max((p["retrieved_at"] for p in active), default=None),
-                "last_nightly": store.last_run(c, "nightly"),
+                "last_daily": store.last_run_by_trigger(c, "scheduled"),
+                "daily_refresh": _daily(c),
                 "last_refresh": store.last_run(c, "refresh"),
                 "running": store.running_runs(c),
                 # Per-login Refresh buttons: these logins are being refreshed (or share an
@@ -427,10 +437,9 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
         if not up or not Path(up["path"]).is_file():
             raise HTTPException(404)
         return FileResponse(up["path"], media_type="application/pdf",
-                            headers={"Content-Security-Policy": "sandbox",
-                                     "X-Content-Type-Options": "nosniff"})
+                            headers=_file_headers("application/pdf"))
 
-    def start_refresh(c, login_ids: list[int] | None) -> dict:
+    def start_refresh(c, login_ids: list[int] | None, trigger: str | None = None) -> dict:
         dashboard = login_ids is None
         """Refreshes run in parallel, one per institution at a time (logins at one
         institution share a browser profile), up to MAX_PARALLEL_RUNS at once."""
@@ -453,7 +462,7 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
                     raise HTTPException(409, "Every login is already being refreshed.")
             run_id = store.start_run(c, "refresh")
             store.set_run_logins(c, run_id, login_ids,
-                                 "dashboard" if dashboard else "login")
+                                 trigger or ("dashboard" if dashboard else "login"))
 
         def work():
             wc = store.connect(db_path)
@@ -470,6 +479,44 @@ def create_app(db_path: str | None = None, model_loader=None, fetcher=None,
         else:
             work()
         return {"run_id": run_id}
+
+    def _daily(c) -> dict:
+        nxt = schedule.next_at(c, datetime.now())
+        return {**schedule.settings(c), "next": nxt.isoformat(timespec="minutes") if nxt else None}
+
+    @app.get("/api/daily-refresh")
+    def get_daily_refresh(c=Depends(conn)):
+        return _daily(c)
+
+    @app.put("/api/daily-refresh")
+    def put_daily_refresh(body: DailyRefreshIn, c=Depends(conn)):
+        try:
+            schedule.save(c, body.enabled, body.time, datetime.now())
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return _daily(c)
+
+    def _scheduler_loop():
+        """Daily Refresh (schedule.py): one try a day once the set time has passed."""
+        while True:
+            time.sleep(config.SCHEDULE_CHECK_S)
+            try:
+                c = store.connect(db_path)
+                try:
+                    now_local = datetime.now()
+                    if schedule.due(c, now_local):
+                        schedule.mark_tried(c, now_local)
+                        try:
+                            start_refresh(c, None, trigger="scheduled")
+                        except HTTPException as e:    # kill switch, every login busy
+                            log.warning("Daily Refresh not started: %s", e.detail)
+                finally:
+                    c.close()
+            except Exception:
+                log.exception("Daily Refresh check failed")
+
+    if scheduler:
+        threading.Thread(target=_scheduler_loop, daemon=True, name="daily-refresh").start()
 
     @app.post("/api/runs/{rid}/cancel")
     def cancel_run(rid: int, c=Depends(conn)):
@@ -563,12 +610,19 @@ def _serve_evidence(evidence: str | None, name: str) -> FileResponse:
     p = Path(evidence)
     target = (p / name) if p.is_dir() else p
     media = EVIDENCE_TYPES[target.suffix.lower()]
-    return FileResponse(target, media_type=media,
-                        headers={"Content-Security-Policy": "sandbox",
-                                 "X-Content-Type-Options": "nosniff"})
+    return FileResponse(target, media_type=media, headers=_file_headers(media))
+
+
+def _file_headers(media: str) -> dict:
+    """Saved files are never run as pages. A PDF gets no CSP sandbox: Chrome's PDF viewer
+    won't open in a sandboxed document and shows a blank page."""
+    h = {"X-Content-Type-Options": "nosniff"}
+    if media != "application/pdf":
+        h["Content-Security-Policy"] = "sandbox"
+    return h
 
 
 def main():
     import uvicorn
-    uvicorn.run(create_app(), host=config.HOST, port=config.PORT, log_level="warning")
+    uvicorn.run(create_app(scheduler=True), host=config.HOST, port=config.PORT, log_level="warning")
 

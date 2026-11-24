@@ -24,6 +24,10 @@ BROWSER_PROFILES_DIR = Path(os.getenv("PA_BROWSER_DIR", PRIVATE_DIR / "browser")
 # Key that encrypts stored logins and PDF passwords. Owner-only file, not Keychain (spec D18).
 KEY_PATH = Path(os.getenv("PA_KEY_PATH", Path.home() / ".portfolio-agent" / "secret.key"))
 
+# Daily Refresh (spec §3): the time it starts unless changed in the dashboard (local time).
+DAILY_REFRESH_TIME = os.getenv("PA_DAILY_REFRESH_TIME", "20:15")
+SCHEDULE_CHECK_S = 30            # how often `serve` checks whether the daily Refresh is due
+
 # Kill switch: while this file exists, no fetcher runs (spec §9.2).
 KILL_FILE = Path(os.getenv("PA_KILL_FILE", PRIVATE_DIR / "STOP"))
 

@@ -43,7 +43,7 @@ python -m portfolio_agent.cli serve      # dashboard at http://127.0.0.1:8765 (e
    - If the portal asks for a verification code, the inbox asks you for it.
    - If the portal shows a **CAPTCHA**, the fetcher's window comes to the front and the Inbox says so. Solve it there; the run carries on by itself (it waits up to 5 minutes, `PA_CAPTCHA_WAIT`). The fetcher never answers a CAPTCHA itself.
    - If a page is rejected because it shows a number that isn't an account (e.g. a member number), press **Accept accounts read** on the Inbox item. The number is saved under the login's **Numbers that aren't accounts**, and the accounts read are checked again and held for your approval.
-5. **Nightly run:** `python -m portfolio_agent.cli nightly`. Schedule it with launchd. Each login is limited to 2 logins per night.
+5. **Daily Refresh:** while `serve` is running, the app starts the Dashboard's Refresh (every active Browser login) once a day, at 8:15 PM by default. Change the time or turn it off under **Accounts & logins → Daily Refresh**. If the Mac was asleep or `serve` wasn't running at that time, it starts when they're back, the same day; a day missed entirely is skipped. A time set to earlier than now starts tomorrow. Logins that need a code or a CAPTCHA wait in the Inbox. (The older `python -m portfolio_agent.cli nightly` command still fetches nightly-cadence logins, limited to 2 logins per night, if you schedule it with launchd.)
 6. **Institutions without daily access: upload statements.**
    - Add a login with access method **Upload statements** and cadence **Monthly**. It needs no URL or password; Refresh and the nightly run skip it.
    - Each month, press **Upload** on the login and pick the PDFs: one per account, or one consolidated statement.
@@ -144,4 +144,4 @@ explicit and easy to show in reports.
 4. Move each tool group behind an MCP server; the agent code doesn't change.
 5. Add the first portal fetcher for one institution, reusing the ReAct graph
    with browser tools and the same validator.
-6. Schedule the nightly run (`launchd` on macOS).
+6. Keep `serve` running for the Daily Refresh (or schedule `cli nightly` with `launchd`).

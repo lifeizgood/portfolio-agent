@@ -237,7 +237,7 @@ Fetching and extracting are separate because fetching acts on live sites and ext
 
 Every tool returns a structured result with its source. A failure (timeout, page not found, wrong PDF password) comes back as an observation, not a crash.
 
-*Today's code: the orchestrator (`runner.py`: nightly run, Refresh, per-login Refresh, parallel runs that never share an institution's browser profile), the portal fetcher (`browser/portal.py`, with the LLM fallback navigator in `browser/navigator.py`), the extractor and validator inside the ingest graph (`ingest_graph.py`), statement upload (`statements.py`), and the ReAct Q&A agent (`react_graph.py`, not yet in the dashboard). The Auth tool has the encrypted credential store (`crypto.py`) and the SMS code reader (`sms.py`); there's no email code reader, statement fetcher, analyst or manual-input path yet.*
+*Today's code: the orchestrator (`runner.py`: nightly run, Refresh, per-login Refresh, a Daily Refresh that `serve` starts at a time set in the dashboard, 8:15 PM by default (`schedule.py`) [U, 2026-11-23], parallel runs that never share an institution's browser profile), the portal fetcher (`browser/portal.py`, with the LLM fallback navigator in `browser/navigator.py`), the extractor and validator inside the ingest graph (`ingest_graph.py`), statement upload (`statements.py`), and the ReAct Q&A agent (`react_graph.py`, not yet in the dashboard). The Auth tool has the encrypted credential store (`crypto.py`) and the SMS code reader (`sms.py`); there's no email code reader, statement fetcher, analyst or manual-input path yet.*
 
 ---
 
