@@ -380,6 +380,7 @@ def test_api_end_to_end(client):
     assert set(src["evidence_files"]) == {"page.html", "page.png", "page.txt"}
     html = client.get(f"/api/snapshots/{sid}/evidence/page.html")
     assert html.headers["content-type"].startswith("text/plain")          # never rendered
+    assert html.headers["content-security-policy"] == "sandbox"
     assert client.get(f"/api/snapshots/{sid}/evidence/..%2F..%2Fsecret.key").status_code == 404
     assert client.get("/api/series").json()["total"][-1] == 25000
     assert client.get("/api/summary").json()["net_worth"] == 25000
@@ -2069,3 +2070,70 @@ def test_as_of_one_day_ahead_is_accepted():
     future = lambda r: [e for e in r.errors if "in the future" in e]
     assert not future(validate(snap(as_of="2026-11-23T01:00:00"), today=today))
     assert future(validate(snap(as_of="2026-11-24T09:00:00"), today=today))
+
+
+def test_saved_pdfs_open_in_chromes_viewer():
+    # Chrome's PDF viewer shows a blank page under a CSP sandbox, so PDFs get none.
+    from portfolio_agent.web.app import _file_headers
+    assert "Content-Security-Policy" not in _file_headers("application/pdf")
+    assert _file_headers("application/pdf")["X-Content-Type-Options"] == "nosniff"
+    assert _file_headers("text/plain")["Content-Security-Policy"] == "sandbox"
+    assert _file_headers("image/png")["Content-Security-Policy"] == "sandbox"
+
+
+# --- daily Refresh ------------------------------------------------------------------
+
+def test_daily_refresh_due_once_a_day(conn):
+    from datetime import datetime
+    from portfolio_agent import schedule
+    assert schedule.settings(conn) == {"enabled": True, "time": "20:15"}     # default 8:15 PM
+    before, after = datetime(2026, 11, 23, 20, 14), datetime(2026, 11, 23, 20, 15)
+    assert not schedule.due(conn, before) and schedule.due(conn, after)
+    assert schedule.next_at(conn, before) == datetime(2026, 11, 23, 20, 15)
+    schedule.mark_tried(conn, after)                       # one try a day
+    assert not schedule.due(conn, datetime(2026, 11, 23, 23, 0))
+    assert schedule.next_at(conn, after) == datetime(2026, 11, 24, 20, 15)
+    assert schedule.due(conn, datetime(2026, 11, 24, 21, 0))  # Mac woke late: same day
+    # A time set to earlier than now starts tomorrow, not straight away.
+    schedule.save(conn, True, "07:30", datetime(2026, 11, 25, 9, 0))
+    assert not schedule.due(conn, datetime(2026, 11, 25, 9, 1))
+    assert schedule.due(conn, datetime(2026, 11, 26, 7, 30))
+    schedule.save(conn, False, "07:30", datetime(2026, 11, 26, 6, 0))
+    assert not schedule.due(conn, datetime(2026, 11, 26, 8, 0))
+    assert schedule.next_at(conn, datetime(2026, 11, 26, 8, 0)) is None
+    for bad in ("8:15pm", "24:00", ""):
+        with pytest.raises(ValueError):
+            schedule.save(conn, True, bad, datetime(2026, 11, 26, 6, 0))
+
+
+def test_daily_refresh_settings_api(client):
+    d = client.get("/api/daily-refresh").json()
+    assert d["enabled"] and d["time"] == "20:15" and d["next"]
+    assert client.put("/api/daily-refresh", json={"enabled": True, "time": "nope"},
+                      headers=H).status_code == 400
+    d = client.put("/api/daily-refresh", json={"enabled": False, "time": "06:45"}, headers=H).json()
+    assert d == {"enabled": False, "time": "06:45", "next": None}
+    assert client.get("/api/summary").json()["daily_refresh"]["time"] == "06:45"
+
+
+def test_serve_starts_the_daily_refresh(tmp_path, monkeypatch):
+    import time as _time
+    monkeypatch.setattr(config, "SCHEDULE_CHECK_S", 0.05)
+    db = str(tmp_path / "d.db")
+    c = store.connect(db)
+    lid = add_login(c)
+    add_login(c, name="Statements", institution="Other", access_method="upload")
+    store.set_setting(c, "daily_refresh_time", "00:00")       # already due today
+    calls = []
+    def fetch(login, creds, ctx):
+        calls.append(login["id"])
+        raise FetchStopped("cancelled", "stop here")
+    create_app(db, model_loader=lambda: None, fetcher=fetch, scheduler=True)
+    for _ in range(100):
+        r = store.last_run_by_trigger(c, "scheduled")
+        if r and r["finished_at"]:
+            break
+        _time.sleep(0.05)
+    assert r and r["kind"] == "refresh" and calls == [lid]   # Browser logins only
+    _time.sleep(0.3)
+    assert len(c.execute("SELECT id FROM runs WHERE trigger='scheduled'").fetchall()) == 1

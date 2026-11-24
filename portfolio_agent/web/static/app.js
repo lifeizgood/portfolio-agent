@@ -104,6 +104,33 @@ $("#period").addEventListener("click", (e) => {
   loadChart();
 }));
 
+function clock(hhmm) {           // "20:15" -> "8:15 PM" in the browser's format
+  const [h, m] = hhmm.split(":").map(Number);
+  return new Date(2000, 0, 1, h, m).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+function nextTime(iso) {         // local "YYYY-MM-DDTHH:MM" from the server
+  if (!iso) return "–";
+  const t = new Date(iso), today = new Date();
+  const tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+  const day = t.toDateString() === today.toDateString() ? "today"
+    : t.toDateString() === tomorrow.toDateString() ? "tomorrow" : t.toLocaleDateString();
+  return `${day} ${clock(iso.slice(11, 16))}`;
+}
+async function loadDaily() {
+  const d = await api("/api/daily-refresh"), f = $("#daily-form");
+  f.enabled.checked = d.enabled; f.time.value = d.time;
+  $("#daily-status").textContent = d.enabled ? `Next: ${nextTime(d.next)}.` : "Off: Refresh runs only when you press it.";
+}
+$("#daily-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    await api("/api/daily-refresh", { method: "PUT", body: { enabled: f.enabled.checked, time: f.time.value } });
+    await loadDaily();
+    $("#daily-status").textContent = "Saved. " + $("#daily-status").textContent;
+  } catch (err) { $("#daily-status").textContent = err.message; }
+});
+
 async function loadSummary() {
   const s = await api("/api/summary");
   const full = basis === "full" && s.has_part_owned;
@@ -112,9 +139,10 @@ async function loadSummary() {
   $("#net-worth-note").textContent = (s.latest_retrieval ? `latest data retrieved ${when(s.latest_retrieval)}` : "no data yet")
     + (!s.has_part_owned ? "" : full ? ` · whole accounts; your share ${money(s.net_worth)}`
       : ` · part-owned accounts at your share; whole accounts ${money(s.net_worth_full)}`);
-  const n = s.last_nightly;
-  $("#last-nightly").textContent = n ? when(n.finished_at || n.started_at) : "never";
-  $("#last-nightly-note").textContent = n ? `${n.status}${n.summary ? ": " + n.summary : ""}` : "schedule: see README";
+  const d = s.daily_refresh, n = s.last_daily;
+  $("#daily-next").textContent = d.enabled ? `next ${nextTime(d.next)}` : "off";
+  $("#daily-note").textContent = n ? `last ${when(n.finished_at || n.started_at)}: ${n.summary || n.status}`
+    : (d.enabled ? `daily at ${clock(d.time)}; not run yet` : "turn it on under Accounts & logins");
   $("#kill-banner").hidden = !s.kill_switch;
   const badge = $("#inbox-badge");
   badge.hidden = !s.inbox_open; badge.textContent = s.inbox_open;
@@ -452,6 +480,7 @@ $("#email-reader-remove").addEventListener("click", async () => {
 
 async function loadAccounts() {
   loadOwners();
+  loadDaily();
   loadEmailReader();
   const logins = await api("/api/logins");
   const tb = $("#login-list tbody"); tb.innerHTML = "";
@@ -513,7 +542,7 @@ function applyBusy(s) {
     setRunButton(b, runOf[lid], isBusy || b.dataset.can !== "1",
       isBusy ? "Another login at this institution is being refreshed" : "");
   });
-  const dash = (s.running || []).find((r) => r.trigger === "dashboard");
+  const dash = (s.running || []).find((r) => r.trigger === "dashboard" || r.trigger === "scheduled");
   setRunButton($("#refresh-btn"), dash, !s.refresh_all_available,
     s.refresh_all_available ? "" : "Every login is already being refreshed");
 }

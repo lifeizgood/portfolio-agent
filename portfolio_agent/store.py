@@ -143,6 +143,11 @@ CREATE TABLE IF NOT EXISTS statement_uploads (  -- statement files the user uplo
     outcome      TEXT,                       -- stored | held | mixed | review | stopped | error
     detail       TEXT
 );
+CREATE TABLE IF NOT EXISTS settings (           -- app settings shown in the dashboard
+    name         TEXT PRIMARY KEY,
+    value        TEXT,
+    updated_at   TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS login_attempts (
     id           INTEGER PRIMARY KEY,
     account_id   INTEGER NOT NULL,
@@ -636,6 +641,24 @@ def set_upload_result(conn, upload_id: int, run_id: int, outcome: str, detail: s
 
 
 # --- runs and login attempts -------------------------------------------------
+
+def get_setting(conn, name: str, default: str | None = None) -> str | None:
+    r = conn.execute("SELECT value FROM settings WHERE name=?", (name,)).fetchone()
+    return r["value"] if r else default
+
+
+def set_setting(conn, name: str, value: str | None) -> None:
+    conn.execute("INSERT INTO settings (name, value, updated_at) VALUES (?,?,?)"
+                 " ON CONFLICT(name) DO UPDATE SET value=excluded.value,"
+                 " updated_at=excluded.updated_at", (name, value, now_iso()))
+    conn.commit()
+
+
+def last_run_by_trigger(conn, trigger: str) -> dict | None:
+    r = conn.execute("SELECT id FROM runs WHERE trigger=? ORDER BY id DESC LIMIT 1",
+                     (trigger,)).fetchone()
+    return get_run(conn, r["id"]) if r else None
+
 
 def start_run(conn, kind: str) -> int:
     cur = conn.execute("INSERT INTO runs (kind, started_at, pid) VALUES (?,?,?)",

@@ -85,7 +85,7 @@ def main(argv=None):
 
         from .web.app import create_app
         print(f"Dashboard: http://{config.HOST}:{config.PORT}")
-        uvicorn.run(create_app(args.db), host=config.HOST, port=config.PORT, log_level="warning")
+        uvicorn.run(create_app(args.db, scheduler=True), host=config.HOST, port=config.PORT, log_level="warning")
 
     elif args.cmd in ("nightly", "refresh"):
         from .llm import load_chat_model

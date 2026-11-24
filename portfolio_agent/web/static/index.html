@@ -24,9 +24,9 @@
   <div class="tiles">
     <div class="tile"><div class="label">Net worth</div><div id="net-worth" class="big">–</div>
       <div id="net-worth-note" class="muted"></div></div>
-    <div class="tile"><div class="label">Last nightly run</div><div id="last-nightly">–</div>
-      <div id="last-nightly-note" class="muted"></div></div>
-    <div class="tile"><div class="label">Refresh public-security accounts</div>
+    <div class="tile"><div class="label">Daily Refresh</div><div id="daily-next">–</div>
+      <div id="daily-note" class="muted"></div></div>
+    <div class="tile"><div class="label">Refresh browser logins</div>
       <button id="refresh-btn" class="primary">Refresh</button>
       <div id="refresh-status" class="muted"></div></div>
   </div>
@@ -101,6 +101,17 @@
     <table id="login-list"><thead><tr><th>Login</th><th>Institution</th><th>Accounts</th><th>Cadence</th>
       <th>Refresh supported</th><th>Last updated</th><th></th></tr></thead><tbody></tbody></table>
     <button id="new-login">Add login</button>
+  </div>
+
+  <div class="card" id="daily-card">
+    <h2>Daily Refresh</h2>
+    <p class="muted">Once a day at this time the app starts the Dashboard's Refresh: every active login with access method Browser. It runs only while the dashboard (<code>serve</code>) is running and the Mac is awake; if it was off or asleep at that time, the Refresh starts when it's back, the same day. Logins that need a code or a CAPTCHA wait for you in the Inbox.</p>
+    <form id="daily-form" class="controls">
+      <label class="check"><input type="checkbox" name="enabled"> Run daily</label>
+      <label>Time <input name="time" type="time" required></label>
+      <button type="submit">Save</button>
+    </form>
+    <p id="daily-status" class="muted"></p>
   </div>
 
   <div class="card" id="email-reader-card">
